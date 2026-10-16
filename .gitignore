@@ -1,0 +1,101 @@
+# ==============================================================================
+# Git Ignore Configuration - Mini Knowledge Assistant
+# ==============================================================================
+
+# Operating System Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+[Dd]esktop.ini
+
+# IDE & Editor Files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# Environment Variables & Secrets (CRITICAL: Never commit secrets)
+.env
+.env.*
+!.env.example
+secrets.json
+*.pem
+*.key
+
+# Python & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.venv/
+venv/
+ENV/
+env/
+.uv/
+
+# Node.js & React Frontend
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+.pnpm-store/
+frontend/dist/
+frontend/build/
+.eslintcache
+
+# Databases, Vector Indexes & SQLite
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.sqlite-journal
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+!data/.gitkeep
+
+# Testing, Coverage & Benchmarking
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+.deepeval/
+deepeval_test_results/
+
+# Logs & Runtime Dumps
+*.log
+logs/
+*.pid
+*.seed
+tmp/
+scratch/
