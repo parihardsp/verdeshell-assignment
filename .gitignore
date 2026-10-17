@@ -77,6 +77,9 @@ frontend/build/
 data/*.db
 data/*.sqlite
 data/*.sqlite3
+data/uploads/
+data/chroma_db/
+chroma_db/
 !data/.gitkeep
 
 # Testing, Coverage & Benchmarking
