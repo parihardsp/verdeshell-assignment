@@ -205,7 +205,6 @@ class DocumentExtractor:
             pages = []
             full_text_parts = []
             with pymupdf.open(str(file_path)) as doc:
-                total_pages = len(doc)
                 for idx, page in enumerate(doc):
                     text = page.get_text().strip()
                     if text:
@@ -541,7 +540,6 @@ class DocumentExtractor:
             )
 
         # Standard text encodings
-        encodings = ["utf-8", "utf-8-sig", "latin-1", "cp1252"]
         text = ""
 
         # Test UTF-8 first (strict)

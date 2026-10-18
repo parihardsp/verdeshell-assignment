@@ -568,3 +568,40 @@ async def test_grounded_synthesizer_insufficient_context_gating():
     assert "does not contain information" in res.answer
     assert len(res.sources) == 0
     assert res.confidence_score == 0.0
+
+
+@pytest.mark.asyncio
+async def test_rag_pipeline_empty_session_fast_exit():
+    """Verify that querying an empty session returns an immediate fast guidance response without calling the LLM or embedding provider."""
+    import chromadb
+
+    from app.providers.vector_store import ChromaVectorStore
+    from app.rag.pipeline import RAGPipeline
+    from app.rag.reranker import PassThroughReranker
+    from app.rag.retriever import HybridRetriever
+
+    vector_store = ChromaVectorStore(client=chromadb.EphemeralClient())
+    retriever = HybridRetriever(
+        embedding_provider=MockEmbeddingProvider(), vector_store=vector_store
+    )
+
+    class TrackingFailLLM(MockLLMProvider):
+        async def generate_structured(self, *args, **kwargs):
+            pytest.fail("LLM must not be called when session has zero indexed documents!")
+
+    pipeline = RAGPipeline(
+        retriever=retriever,
+        reranker=PassThroughReranker(),
+        synthesizer=GroundedSynthesizer(llm_provider=TrackingFailLLM()),
+    )
+
+    response = await pipeline.run(
+        question="What are the details of the policy?",
+        session_id="sess_empty_123",
+        user_id="usr_empty_123",
+    )
+
+    assert "does not contain information to answer this question" in response.answer
+    assert len(response.sources) == 0
+    assert response.confidence_score == 0.0
+    assert response.latency_ms >= 0

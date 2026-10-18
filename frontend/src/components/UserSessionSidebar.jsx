@@ -47,6 +47,11 @@ export default function UserSessionSidebar({
   const failedDocs = documents.filter((d) => d.status === "failed");
   const totalChunks = indexedDocs.reduce((acc, d) => acc + (d.chunk_count || 0), 0);
 
+  // Avoid ghost sessions: dynamically include active session in dropdown even before first document/message
+  const allDisplaySessions = availableSessions.includes(sessionId)
+    ? availableSessions
+    : [sessionId, ...availableSessions];
+
   return (
     <aside className="user-session-sidebar" aria-label="User and Session Intelligence Hub">
       {/* Mobile-Only Drawer Header with prominent close button */}
@@ -165,7 +170,7 @@ export default function UserSessionSidebar({
         </div>
 
         {/* Recent user sessions switcher */}
-        {availableSessions.length > 1 && (
+        {allDisplaySessions.length > 1 && (
           <div className="session-switch-wrapper">
             <label htmlFor="session-switch-select" className="session-switch-label">
               Switch Session:
@@ -176,9 +181,13 @@ export default function UserSessionSidebar({
               onChange={(e) => onSelectSession(e.target.value)}
               className="session-switch-select"
             >
-              {availableSessions.map((sId) => (
+              {allDisplaySessions.map((sId) => (
                 <option key={sId} value={sId}>
-                  {sId === sessionId ? `● ${sId} (Current)` : sId}
+                  {sId === sessionId
+                    ? availableSessions.includes(sId)
+                      ? `● ${sId} (Current)`
+                      : `● ${sId} (Current - Fresh)`
+                    : sId}
                 </option>
               ))}
             </select>

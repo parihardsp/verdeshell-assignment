@@ -364,10 +364,19 @@ class DocumentService:
                     processed_files=file_index - 1,
                 )
 
+            logger.info(
+                "[Step 1/5 - INGESTION] Processing uploaded file | file=%s size_bytes=%d user_id=%s session_id=%s",
+                filename,
+                file_size,
+                active_user_id,
+                active_session_id,
+                extra={"phase": LogPhase.INGESTION},
+            )
+
             extraction = await asyncio.to_thread(DocumentExtractor.extract_from_path, saved_path)
             content_hash = FileValidationService.compute_sha256(extraction.full_text)
             logger.info(
-                "Document extraction completed | file=%s pages=%d chars=%d",
+                "[Step 2/5 - EXTRACTION] Multi-tier document parsing completed | file=%s pages=%d chars=%d",
                 filename,
                 extraction.total_pages,
                 len(extraction.full_text),
@@ -542,7 +551,7 @@ class DocumentService:
                 )
 
             logger.info(
-                "Document chunking completed | file=%s chunks=%d pages=%d",
+                "[Step 3/5 - CHUNKING] Document partitioned into semantic chunks | file=%s chunks=%d pages=%d",
                 filename,
                 len(all_text_chunks),
                 extraction.total_pages,
@@ -563,7 +572,7 @@ class DocumentService:
             provider_name = self.embedding_provider.__class__.__name__
             embeddings = await self.embedding_provider.embed_batch(chunk_texts)
             logger.info(
-                "Embeddings generated | file=%s count=%d dim=%d provider=%s",
+                "[Step 4/5 - EMBEDDING] Embeddings generated | file=%s count=%d dim=%d provider=%s",
                 filename,
                 len(embeddings),
                 len(embeddings[0]) if embeddings else 0,
@@ -622,9 +631,10 @@ class DocumentService:
             await self.doc_repo.update_status(
                 saved_doc.id, status="indexed", chunk_count=len(chunk_records)
             )
+            await self.doc_repo.session.commit()
 
             logger.info(
-                "File indexing completed | file=%s doc_id=%s chunks=%d store_total=%d",
+                "[Step 5/5 - VECTOR_STORE] File indexing completed | file=%s doc_id=%s chunks=%d store_total=%d status=indexed",
                 filename,
                 saved_doc.id,
                 len(chunk_records),
@@ -661,6 +671,7 @@ class DocumentService:
             )
             if saved_doc:
                 await self.doc_repo.update_status(saved_doc.id, status="failed")
+                await self.doc_repo.session.commit()
             if job_id:
                 await global_job_manager.update_progress(
                     job_id=job_id,
@@ -736,6 +747,9 @@ class DocumentService:
                 total_files=total_files,
             )
             processed_summaries.append(summary)
+
+        # Ensure final state is committed to SQLite before broadcasting terminal SSE event
+        await self.doc_repo.session.commit()
 
         # Notify job manager of completion
         indexed_items = [s.model_dump() for s in processed_summaries if s.status == "indexed"]

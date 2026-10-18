@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import io
 import logging
-import os
 import re
 import shutil
 import sys
@@ -22,7 +21,6 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
 
 # ==============================================================================
 # 1. Context Variables (Tenant & Request Tracing)
@@ -109,18 +107,19 @@ def log_phase(phase: str):
 
 
 def generate_standard_user_id(prefix: str = "usr") -> str:
-    """Generate a standard unique user identifier (e.g. 'usr_9f1a2b3c')."""
-    return f"{prefix}_{uuid.uuid4().hex[:8]}"
+    """Generate a standard unique user identifier (e.g. 'usr_9f1a2b')."""
+    return f"{prefix}_{uuid.uuid4().hex[:6]}"
 
 
 def generate_standard_session_id(prefix: str = "sess") -> str:
-    """Generate a standard unique session identifier (e.g. 'sess_4d5e6f7a')."""
-    return f"{prefix}_{uuid.uuid4().hex[:8]}"
+    """Generate a standard unique session identifier (e.g. 'sess_4d5e6f')."""
+    return f"{prefix}_{uuid.uuid4().hex[:6]}"
 
 
 def generate_friendly_session_id(prefix: str = "session") -> str:
     """Generate a standard unique session identifier."""
     return generate_standard_session_id(prefix=prefix)
+
 
 
 # ==============================================================================
@@ -286,18 +285,49 @@ SessionContextFilter = UserSessionContextFilter
 
 
 # ==============================================================================
-# 4. Standard Enterprise Formatter
+# 4. Standard Enterprise Formatter (Vibrant ANSI Colors)
 # ==============================================================================
+
+ANSI_RESET = "\033[0m"
+ANSI_DIM = "\033[2m"
+ANSI_BOLD = "\033[1m"
+ANSI_CYAN = "\033[36m"
+ANSI_BRIGHT_CYAN = "\033[96m"
+ANSI_GREEN = "\033[32m"
+ANSI_BRIGHT_GREEN = "\033[92m"
+ANSI_YELLOW = "\033[33m"
+ANSI_BRIGHT_YELLOW = "\033[93m"
+ANSI_RED = "\033[31m"
+ANSI_BRIGHT_RED = "\033[91m"
+ANSI_MAGENTA = "\033[35m"
+ANSI_BRIGHT_MAGENTA = "\033[95m"
+ANSI_BLUE = "\033[34m"
+ANSI_BRIGHT_BLUE = "\033[94m"
+ANSI_GRAY = "\033[90m"
+
+LEVEL_COLORS = {
+    "DEBUG": ANSI_MAGENTA,
+    "INFO": ANSI_BRIGHT_GREEN,
+    "WARNING": ANSI_BRIGHT_YELLOW,
+    "ERROR": ANSI_BRIGHT_RED,
+    "CRITICAL": f"{ANSI_BOLD}{ANSI_BRIGHT_RED}",
+}
 
 
 class StandardLogFormatter(logging.Formatter):
-    """Formats logs to enterprise standard:
+    """Formats logs to enterprise standard with vibrant ANSI color highlights:
     Timestamp | Level | Phase | request_id | user_id | session_id | Module | Message | Metadata
     """
 
-    def __init__(self, fmt: str | None = None, datefmt: str | None = None):
+    def __init__(
+        self,
+        fmt: str | None = None,
+        datefmt: str | None = None,
+        use_color: bool = True,
+    ):
         super().__init__(fmt=fmt, datefmt=datefmt)
         self.custom_fmt = fmt
+        self.use_color = use_color
 
     def format(self, record: logging.LogRecord) -> str:
         # Backward-compatibility for explicit custom formats without standard columns
@@ -352,10 +382,25 @@ class StandardLogFormatter(logging.Formatter):
         else:
             composed_msg = raw_msg
 
-        log_line = (
-            f"{timestamp_str} | {level_str} | {phase_str} | {req_id} | {u_id} | {s_id} | "
-            f"{module_name} | {composed_msg}"
-        )
+        if self.use_color:
+            color_level = LEVEL_COLORS.get(level_str, ANSI_RESET)
+            c_timestamp = f"{ANSI_CYAN}{timestamp_str}{ANSI_RESET}"
+            c_level = f"{color_level}{level_str}{ANSI_RESET}"
+            c_phase = f"{ANSI_BRIGHT_MAGENTA}{phase_str}{ANSI_RESET}"
+            c_req = f"{ANSI_YELLOW}{req_id}{ANSI_RESET}"
+            c_user = f"{ANSI_BRIGHT_CYAN}{u_id}{ANSI_RESET}"
+            c_sess = f"{ANSI_BRIGHT_BLUE}{s_id}{ANSI_RESET}"
+            c_mod = f"{ANSI_GRAY}{module_name}{ANSI_RESET}"
+            sep = f"{ANSI_GRAY}|{ANSI_RESET}"
+            log_line = (
+                f"{c_timestamp} {sep} {c_level} {sep} {c_phase} {sep} {c_req} {sep} "
+                f"{c_user} {sep} {c_sess} {sep} {c_mod} {sep} {composed_msg}"
+            )
+        else:
+            log_line = (
+                f"{timestamp_str} | {level_str} | {phase_str} | {req_id} | {u_id} | {s_id} | "
+                f"{module_name} | {composed_msg}"
+            )
 
         if record.exc_info:
             if not record.exc_text:

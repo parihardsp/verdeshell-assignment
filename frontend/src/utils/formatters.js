@@ -44,16 +44,27 @@ export function parseBotAnswer(rawText) {
 
   const lower = cleaned.toLowerCase();
 
-  const isRefusal =
+  const isEmptySession =
+    lower.includes("does not contain any uploaded documents") ||
+    lower.includes("no documents, pdfs, or notes have been uploaded") ||
+    lower.includes("no documents or notes have been uploaded") ||
+    lower.includes("session is empty") ||
+    lower.includes("session knowledge base is empty") ||
+    lower.includes("no documents or notes have been added");
+
+  const isNoMatch =
     lower.includes("does not contain sufficient information") ||
     lower.includes("does not contain information") ||
     lower.includes("insufficient information");
+
+  const isRefusal = isEmptySession || isNoMatch;
 
   if (isRefusal) {
     return {
       summary: cleaned,
       breakdown: null,
       isRefusal: true,
+      refusalType: isEmptySession ? "empty_session" : "no_relevant_info",
     };
   }
 

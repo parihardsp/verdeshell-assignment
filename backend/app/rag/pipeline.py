@@ -50,12 +50,64 @@ class RAGPipeline:
 
         start_time = time.perf_counter()
         logger.info(
-            "RAG pipeline started | top_k=%d top_n=%d client_ip=%s",
+            "[Step 1/4 - REQUEST] Incoming question received | question='%s' session_id=%s user_id=%s top_k=%d top_n=%d client_ip=%s",
+            question,
+            session_id,
+            user_id,
             self.top_k,
             self.top_n,
             client_ip,
-            extra={"phase": LogPhase.RETRIEVAL},
+            extra={"phase": LogPhase.REQUEST},
         )
+
+        # Stage 0: Fast Interception for Empty Session Knowledge Base
+        # Prevents redundant embedding API and LLM generation calls when zero documents exist
+        if hasattr(self.retriever, "vector_store") and getattr(self.retriever, "vector_store", None):
+            existing_chunks = await self.retriever.vector_store.get_all_chunks(
+                session_id=session_id, user_id=user_id
+            )
+            if not existing_chunks:
+                total_latency_ms = max(1, int((time.perf_counter() - start_time) * 1000))
+                session_label = session_id or "default"
+                empty_message = (
+                    f"The provided knowledge base for session '{session_label}' does not contain information to answer this question. "
+                    "No documents, PDFs, or notes have been uploaded to this session yet."
+                )
+                logger.info(
+                    "[Step 1/4 - GUARDRAIL] Early interception: Session '%s' contains 0 uploaded documents | action=fast_guidance user_id=%s latency_ms=%d",
+                    session_label,
+                    user_id,
+                    total_latency_ms,
+                    extra={"phase": LogPhase.RESPONSE},
+                )
+                if self.query_repo:
+                    try:
+                        history = QuestionHistory(
+                            question=question,
+                            answer=empty_message,
+                            sources=[],
+                            session_id=session_id or "default",
+                            user_id=user_id or "default_user",
+                            latency_ms=total_latency_ms,
+                            client_ip=client_ip,
+                        )
+                        await self.query_repo.create(history)
+                    except Exception as exc:
+                        logger.error(
+                            "Audit log creation failed | error=%s",
+                            type(exc).__name__,
+                            extra={"phase": LogPhase.DATABASE},
+                        )
+
+                return AskResponse(
+                    answer=empty_message,
+                    sources=[],
+                    session_id=session_id,
+                    user_id=user_id,
+                    latency_ms=total_latency_ms,
+                    confidence_score=0.0,
+                    response_type="empty_session",
+                )
 
         # Stage 1: Retrieval
         candidate_chunks = await self.retriever.retrieve(
@@ -65,12 +117,26 @@ class RAGPipeline:
             top_k=self.top_k,
             threshold=self.similarity_threshold,
         )
+        logger.info(
+            "[Step 2/4 - RETRIEVAL] Parallel dual-channel search completed | candidates_retrieved=%d top_k=%d threshold=%.2f",
+            len(candidate_chunks),
+            self.top_k,
+            self.similarity_threshold,
+            extra={"phase": LogPhase.RETRIEVAL},
+        )
 
         # Stage 2: Reranking
         pruned_chunks = await self.reranker.rerank(
             query=question,
             candidates=candidate_chunks,
             top_n=self.top_n,
+        )
+        logger.info(
+            "[Step 3/4 - RERANKING] Cross-attention reranking completed | input_chunks=%d pruned_top_n=%d reranker=%s",
+            len(candidate_chunks),
+            len(pruned_chunks),
+            self.reranker.__class__.__name__,
+            extra={"phase": LogPhase.RERANKING},
         )
 
         # Stage 3: Grounded Synthesis
@@ -81,11 +147,17 @@ class RAGPipeline:
         )
 
         total_latency_ms = int((time.perf_counter() - start_time) * 1000)
+        has_context = getattr(synthesis_result, "has_sufficient_context", True)
+        is_no_match = (not has_context) or (len(synthesis_result.sources) == 0)
+        resp_type = "no_relevant_info" if is_no_match else "grounded"
+
         logger.info(
-            "RAG pipeline completed | citations=%d confidence=%.2f latency_ms=%d",
+            "[Step 4/4 - SYNTHESIS] Grounded answer formulated | provider=%s citations=%d confidence=%.2f latency_ms=%d response_type=%s",
+            self.synthesizer.__class__.__name__,
             len(synthesis_result.sources),
             synthesis_result.confidence_score,
             total_latency_ms,
+            resp_type,
             extra={"phase": LogPhase.RESPONSE},
         )
 
@@ -110,6 +182,10 @@ class RAGPipeline:
                     extra={"phase": LogPhase.DATABASE},
                 )
 
+        has_context = getattr(synthesis_result, "has_sufficient_context", True)
+        is_no_match = (not has_context) or (len(synthesis_result.sources) == 0)
+        resp_type = "no_relevant_info" if is_no_match else "grounded"
+
         return AskResponse(
             answer=synthesis_result.answer,
             sources=synthesis_result.sources,
@@ -117,4 +193,5 @@ class RAGPipeline:
             user_id=user_id,
             latency_ms=total_latency_ms,
             confidence_score=synthesis_result.confidence_score,
+            response_type=resp_type,
         )

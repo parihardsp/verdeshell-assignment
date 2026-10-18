@@ -9,7 +9,13 @@ from app.schemas.document import (
     MultiFileUploadResponse,
     UploadedFileSummary,
 )
-from app.schemas.rag import AskRequest, AskResponse, SourceCitation
+from app.schemas.rag import (
+    AskRequest,
+    AskResponse,
+    QuestionHistoryItem,
+    QuestionHistoryResponse,
+    SourceCitation,
+)
 
 __all__ = [
     "AskRequest",
@@ -21,6 +27,8 @@ __all__ = [
     "ErrorDetail",
     "HealthResponse",
     "MultiFileUploadResponse",
+    "QuestionHistoryItem",
+    "QuestionHistoryResponse",
     "SourceCitation",
     "UploadedFileSummary",
 ]

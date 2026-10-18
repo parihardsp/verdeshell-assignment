@@ -10,9 +10,8 @@ from app.api.dependencies import (
     get_llm_provider,
     get_vector_store,
 )
-from app.db.database import get_db, get_session_factory
-
 from app.core.rate_limiter import global_rate_limiter
+from app.db.database import get_db, get_session_factory
 from app.db.models import Base
 from app.main import app
 from app.providers.embeddings import MockEmbeddingProvider

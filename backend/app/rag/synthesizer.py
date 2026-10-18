@@ -37,6 +37,7 @@ class SynthesizedAnswer:
     sources: list[SourceCitation]
     latency_ms: int = 0
     confidence_score: float | None = 1.0
+    has_sufficient_context: bool = True
 
 
 class BaseSynthesizer(ABC):
@@ -80,6 +81,7 @@ class GroundedSynthesizer(BaseSynthesizer):
                 sources=[],
                 latency_ms=elapsed_ms,
                 confidence_score=0.0,
+                has_sufficient_context=False,
             )
 
         context_blocks, context_str = build_synthesis_context_blocks(context_chunks)
@@ -154,6 +156,7 @@ class GroundedSynthesizer(BaseSynthesizer):
                 sources=[],
                 latency_ms=elapsed_ms,
                 confidence_score=0.0,
+                has_sufficient_context=False,
             )
 
         # Build citations strictly for chunks used/cited by the LLM

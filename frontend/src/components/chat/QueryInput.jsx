@@ -1,7 +1,26 @@
-import React, { useState } from "react";
+import React, { useState, useRef, useEffect } from "react";
 
-export default function QueryInput({ onSend, isLoading, isRateLimited }) {
+export default function QueryInput({ onSend, isLoading, isRateLimited, docCount = 0 }) {
   const [query, setQuery] = useState("");
+  const textareaRef = useRef(null);
+
+  // Auto-resize textarea to expand flexibly up to 4-5 lines (~130px), then scroll
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+
+    el.style.height = "auto";
+    const maxHeight = 130; // ~4-5 lines at 1.5 line-height
+    const scrollHeight = el.scrollHeight;
+
+    if (scrollHeight > maxHeight) {
+      el.style.height = `${maxHeight}px`;
+      el.style.overflowY = "auto";
+    } else {
+      el.style.height = `${Math.max(scrollHeight, 24)}px`;
+      el.style.overflowY = "hidden";
+    }
+  }, [query]);
 
   const handleKeyDown = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -20,11 +39,14 @@ export default function QueryInput({ onSend, isLoading, isRateLimited }) {
     <div className="query-input-container">
       <div className="query-input-wrapper">
         <textarea
+          ref={textareaRef}
           className="query-textarea"
           rows={1}
           placeholder={
             isRateLimited
               ? "Rate limit cooldown active. Please wait..."
+              : docCount === 0
+              ? "Session is empty. Upload documents or ask a question..."
               : "Ask any question from your knowledge base..."
           }
           value={query}

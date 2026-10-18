@@ -1,5 +1,8 @@
 """Pydantic v2 schemas for question answering and RAG grounding."""
 
+from datetime import datetime
+from typing import Any
+
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
@@ -88,6 +91,10 @@ class AskResponse(BaseModel):
         default=None,
         description="Grounded confidence score between 0.0 and 1.0",
     )
+    response_type: str | None = Field(
+        default="grounded",
+        description="Response classification: grounded, empty_session, or no_relevant_info",
+    )
 
 
 class GroundedSynthesisOutput(BaseModel):
@@ -118,3 +125,33 @@ class GroundedSynthesisOutput(BaseModel):
         le=1.0,
         description="Grounded confidence score between 0.0 and 1.0 indicating degree of factual support in context.",
     )
+
+
+class QuestionHistoryItem(BaseModel):
+    """Schema for historical question-answering interaction."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str = Field(..., description="Query history identifier")
+    question: str = Field(..., description="Asked question")
+    answer: str = Field(..., description="Synthesized answer")
+    sources: list[dict[str, Any] | SourceCitation] = Field(
+        default_factory=list, description="Associated source citations"
+    )
+    session_id: str | None = Field(default=None, description="Session identifier")
+    user_id: str = Field(default="default_user", description="User identifier")
+    latency_ms: int = Field(..., description="Execution latency in milliseconds")
+    client_ip: str = Field(..., description="Client IP address")
+    created_at: datetime = Field(..., description="UTC creation timestamp")
+
+
+class QuestionHistoryResponse(BaseModel):
+    """Schema for GET /history response containing list of historical Q&A interactions."""
+
+    items: list[QuestionHistoryItem] = Field(
+        default_factory=list, description="List of Q&A history interactions"
+    )
+    total: int = Field(..., description="Total count of interactions for this filter")
+    session_id: str | None = Field(default=None, description="Session identifier filter")
+    user_id: str | None = Field(default=None, description="User identifier filter")
+

@@ -101,3 +101,71 @@ async def test_validation_errors(async_client: AsyncClient):
     # Empty question
     res_bad_q = await async_client.post("/ask", json={"question": "  "})
     assert res_bad_q.status_code in [400, 422]
+
+
+@pytest.mark.asyncio
+async def test_question_history_api(async_client: AsyncClient):
+    """Verify that question answering records audit logs queryable and purgable via /api/v1/history."""
+    # 1. Seed document
+    doc_payload = {
+        "title": "Security FAQ",
+        "content": "All databases are encrypted at rest with AES-256 keys. TLS 1.3 is enforced on all ingress endpoints.",
+        "session_id": "sess_audit_1",
+        "user_id": "usr_audit",
+    }
+    create_res = await async_client.post(
+        "/api/v1/documents",
+        json=doc_payload,
+        headers={"X-User-ID": "usr_audit", "X-Session-ID": "sess_audit_1"},
+    )
+    assert create_res.status_code == 201
+
+    # 2. Ask question
+    ask_res = await async_client.post(
+        "/api/v1/ask",
+        json={
+            "question": "What encryption standard is used for database at-rest storage?",
+            "session_id": "sess_audit_1",
+            "user_id": "usr_audit",
+        },
+        headers={"X-User-ID": "usr_audit", "X-Session-ID": "sess_audit_1"},
+    )
+    assert ask_res.status_code == 200
+
+    # 3. Retrieve history for this tenant session
+    history_res = await async_client.get(
+        "/api/v1/history",
+        params={"session_id": "sess_audit_1", "user_id": "usr_audit"},
+    )
+    assert history_res.status_code == 200
+    data = history_res.json()
+    assert data["total"] >= 1
+    recent = data["items"][0]
+    assert "encryption standard" in recent["question"]
+    assert recent["user_id"] == "usr_audit"
+    assert recent["session_id"] == "sess_audit_1"
+    assert len(recent["sources"]) > 0
+
+    # 4. Verify tenant isolation (Different user sees 0 records)
+    other_res = await async_client.get(
+        "/api/v1/history",
+        params={"user_id": "usr_completely_different"},
+    )
+    assert other_res.status_code == 200
+    assert other_res.json()["total"] == 0
+
+    # 5. Clear history
+    del_res = await async_client.delete(
+        "/api/v1/history",
+        params={"session_id": "sess_audit_1", "user_id": "usr_audit"},
+    )
+    assert del_res.status_code == 204
+
+    # 6. Verify cleared
+    history_after = await async_client.get(
+        "/api/v1/history",
+        params={"session_id": "sess_audit_1", "user_id": "usr_audit"},
+    )
+    assert history_after.status_code == 200
+    assert history_after.json()["total"] == 0
+

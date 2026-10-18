@@ -154,17 +154,91 @@ The application is configured via environment variables mapped by Pydantic v2 `B
 
 ## REST API Reference
 
-All API routes require or support multi-tenant session scoping via the `X-Session-ID` and `X-User-ID` headers.
+All API routes require or support multi-tenant session scoping via the `X-Session-ID` and `X-User-ID` headers (or cookies/query parameters).
 
 | Method | Endpoint | Description | Request Body / Params | Response |
 | :--- | :--- | :--- | :--- | :--- |
-| `GET` | `/api/v1/health` | Service health, active AI provider inspect, and index statistics | None | `HealthResponse` (200) |
-| `POST` | `/api/v1/documents/upload` | Batch multi-format document upload (PDF, DOCX, DOC, TXT, MD, CSV) | `multipart/form-data` (`files`) | `UploadSummary` (200) |
-| `POST` | `/api/v1/documents` | Create raw text/markdown document directly | JSON (`title`, `content`) | `DocumentResponse` (201) |
-| `GET` | `/api/v1/documents` | List indexed documents for the active tenant session | Query: `skip`, `limit` | List of `DocumentResponse` (200) |
-| `GET` | `/api/v1/documents/{id}` | Inspect document details and chunk breakdown | Path: `id` | `DocumentResponse` (200) |
-| `DELETE` | `/api/v1/documents/{id}` | Purge document and remove all associated vectors | Path: `id` | Status 204 No Content |
-| `POST` | `/api/v1/ask` | 3-stage grounded question answering with citations | JSON (`question`, `session_id`) | `AskResponse` (200) |
+| `GET` | `/api/v1/health` | Service health, active AI provider inspection, and index statistics | None | `HealthResponse` (200) |
+| `POST` | `/api/v1/documents/upload` | **Synchronous Batch Ingestion**: Ingest up to 5 files (`.pdf`, `.docx`, `.doc`, `.txt`, `.md`, `.csv`, max 5MB each) | `multipart/form-data` (`files`) | `MultiFileUploadResponse` (201) |
+| `POST` | `/api/v1/documents/upload?background=true` | **Asynchronous Decoupled Ingestion**: Enqueues indexing into background worker, returns job tracker URLs | `multipart/form-data` (`files`), Query: `background=true` | `AsyncIngestionJobResponse` (202 Accepted) |
+| `GET` | `/api/v1/documents/jobs/{job_id}/events` | **Real-Time Telemetry Stream**: Live SSE event stream emitting file progress, stage, and completion status | Path: `job_id` | `text/event-stream` (SSE Events) |
+| `GET` | `/api/v1/documents/jobs/{job_id}` | **Job Status Snapshot**: Poll current ingestion status, processed file count, and errors | Path: `job_id` | `JobStatusResponse` (200) |
+| `POST` | `/api/v1/documents` | Create raw text/markdown document directly in knowledge base | JSON (`title`, `content`, `session_id`, `user_id`) | `DocumentResponse` (201) |
+| `GET` | `/api/v1/documents` | List indexed documents for the active tenant session | Query: `limit`, `offset`, `session_id`, `user_id`, `as_list` | `DocumentListResponse` (200) |
+| `GET` | `/api/v1/documents/{document_id}` | Inspect document details, total pages, and chunk breakdown | Path: `document_id` | `DocumentResponse` (200) |
+| `DELETE` | `/api/v1/documents/{document_id}` | Cascade purge: deletes document record, chunk metadata, and ChromaDB vectors | Path: `document_id` | Status 204 No Content |
+| `POST` | `/api/v1/ask` | 3-stage grounded question answering with reranking and citations | JSON (`question`, `session_id`, `user_id`) | `AskResponse` (200) |
+| `GET` | `/api/v1/history` | Retrieve persistent Q&A and citation history for the active session and user | Query: `session_id`, `user_id`, `limit` | `QuestionHistoryResponse` (200) |
+| `DELETE` | `/api/v1/history` | Clear Q&A conversation history for a given tenant session or user | Query: `session_id`, `user_id` | Status 204 No Content |
+
+---
+
+### Exercising the Main Endpoints via cURL
+
+#### 1. System Health Check
+```bash
+curl -X GET "http://localhost:8000/api/v1/health" -H "Accept: application/json"
+```
+
+#### 2. Asynchronous Batch Document Upload (Background Mode)
+```bash
+curl -X POST "http://localhost:8000/api/v1/documents/upload?background=true" \
+  -H "X-Session-ID: sess_demo_123" \
+  -H "X-User-ID: usr_tester" \
+  -F "files=@sample.pdf" \
+  -F "files=@notes.docx"
+```
+*Returns HTTP 202 Accepted:*
+```json
+{
+  "job_id": "job_a1b2c3d4",
+  "session_id": "sess_demo_123",
+  "user_id": "usr_tester",
+  "status": "queued",
+  "total_files": 2,
+  "message": "Indexing job queued with 2 file(s).",
+  "poll_url": "/api/v1/documents/jobs/job_a1b2c3d4",
+  "stream_url": "/api/v1/documents/jobs/job_a1b2c3d4/events"
+}
+```
+
+#### 3. Stream Real-Time Ingestion Progress (SSE)
+```bash
+curl -N "http://localhost:8000/api/v1/documents/jobs/job_a1b2c3d4/events"
+```
+*Emits live telemetry data:*
+```text
+data: {"job_id":"job_a1b2c3d4","status":"processing","stage":"chunking","percent":45,"current_file":"sample.pdf"}
+...
+data: {"job_id":"job_a1b2c3d4","status":"completed","stage":"completed","percent":100,"processed_files":2,"failed_files":0}
+```
+
+#### 4. Poll Ingestion Job Status (Fallback Snapshot)
+```bash
+curl -X GET "http://localhost:8000/api/v1/documents/jobs/job_a1b2c3d4"
+```
+
+#### 5. Ask Grounded Question with Citations
+```bash
+curl -X POST "http://localhost:8000/api/v1/ask" \
+  -H "Content-Type: application/json" \
+  -H "X-Session-ID: sess_demo_123" \
+  -d '{
+    "question": "What is the primary conclusion regarding quarterly revenue growth?",
+    "session_id": "sess_demo_123"
+  }'
+```
+
+#### 6. Retrieve Q&A Conversation & Citation History
+```bash
+curl -X GET "http://localhost:8000/api/v1/history?session_id=sess_demo_123" \
+  -H "Accept: application/json"
+```
+
+#### 7. Clear Session Conversation History
+```bash
+curl -X DELETE "http://localhost:8000/api/v1/history?session_id=sess_demo_123"
+```
 
 ---
 
@@ -206,13 +280,14 @@ backend/
 │   ├── ingestion/       # DocumentExtractor, file validation, and partitioned storage
 │   ├── providers/       # Gemini, Groq, ChromaDB, and Mock adapter implementations
 │   ├── rag/             # Chunker, HybridRetriever, 2-Stage Rerankers, and Synthesizer
-│   ├── schemas/         # Pydantic v2 schemas for requests, responses, and citations
+│   ├── schemas/         # Pydantic v2 schemas for requests, responses, jobs, and citations
 │   ├── services/        # High-level domain facades (DocumentService, ChatService, IngestionJobManager)
 │   └── main.py          # ASGI application entry point and lifespan event handlers
 │
 ├── data/                # Local persistent data directory (SQLite WAL and ChromaDB)
 ├── logs/                # Date-partitioned persistent log storage (logs/YYYY-MM-DD/)
 ├── tests/               # 66 automated unit, integration, and benchmark tests
+├── streamlit_app.py     # Python Streamlit reference UI client
 ├── pyproject.toml       # Project dependencies and tool configurations
 └── uv.lock              # Deterministic package lockfile
 ```
@@ -225,3 +300,4 @@ For deeper architectural inquiries and engineering blueprints:
 - **[Backend Architecture Specification](ARCHITECTURE.md)**: Exhaustive technical analysis of request lifecycles, concurrency patterns, and the 100K+ concurrent user scaling roadmap.
 - **[System Architecture (Root)](../ARCHITECTURE.md)**: Global platform architecture covering both React frontend and FastAPI backend.
 - **[Project README (Root)](../README.md)**: Global repository overview, installation, and deployment instructions.
+- **[AI Usage Disclosure (Root)](../AI_USAGE.md)**: Disclosure of AI tooling, design influence, and engineering ownership.

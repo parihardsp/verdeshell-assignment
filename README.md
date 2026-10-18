@@ -24,7 +24,7 @@ A production-grade, enterprise grounded **Retrieval-Augmented Generation (RAG)**
   - Sliding-window rate limiting on `/ask` (20 req / 60s per client IP) with standard `Retry-After` headers and UI cooldown countdown.
   - Standardized enterprise 9-column logging (`Timestamp | Level | Phase | request_id | user_id | session_id | Module | Message | Metadata`), daily date-partitioned storage (`logs/YYYY-MM-DD/`) with 7-day retention, and zero-secret credential masking.
   - SHA-256 deduplication and RFC 7807 sanitized error shielding.
-  - 100% test pass rate across **66 comprehensive unit, integration, and benchmark tests**.
+  - 100% test pass rate across **67 comprehensive unit, integration, and benchmark tests** (67 passed, 1 skipped).
 
 ---
 
@@ -82,7 +82,7 @@ enterprise-knowledge-assistant/
 │   │   ├── services/            # document_service.py, chat_service.py, job_manager.py
 │   │   └── main.py              # Application entrypoint, CORS, lifespan, middleware
 │   ├── logs/                    # Daily date-partitioned logs (logs/YYYY-MM-DD/, 7-day retention)
-│   ├── tests/                   # Pytest test suite (66 passing unit & integration tests)
+│   ├── tests/                   # Pytest test suite (67 passed, 1 skipped unit & integration tests)
 │   ├── streamlit_app.py         # Lightweight Streamlit reference client
 │   ├── ARCHITECTURE.md          # Backend technical architecture specification
 │   └── README.md                # Backend service setup and API reference
@@ -111,6 +111,7 @@ enterprise-knowledge-assistant/
 │   ├── chroma_db/               # ChromaDB persistent vector collection
 │   └── uploads/                 # Session-partitioned document storage
 │
+├── AI_USAGE.md                  # AI coding tools disclosure, design influences & rejected suggestions
 ├── ARCHITECTURE.md              # System architecture, data flow & 10K/100K/1M scalability note
 ├── README.md                    # Root project overview & run guide (this document)
 └── .env.example                 # Standardized environment configuration template
@@ -264,7 +265,7 @@ If you prefer running the lightweight Python Streamlit interface instead of the 
 
 ## 🧪 Running Automated Tests
 
-The backend test suite contains **66 comprehensive unit, integration, and benchmark tests** covering file validation, PyMuPDF / python-docx extraction, rate limiting, session isolation, RRF ranking, Groq reranker, asynchronous background ingestion (HTTP 202), SSE streaming, and DeepEval metrics:
+The backend test suite contains **68 comprehensive unit, integration, and benchmark tests** (67 passed, 1 skipped) covering file validation, PyMuPDF / python-docx extraction, rate limiting, session isolation, RRF ranking, Groq reranker, asynchronous background ingestion (HTTP 202), SSE streaming, and DeepEval metrics:
 
 ```bash
 cd backend
@@ -273,7 +274,7 @@ uv run pytest
 
 Output:
 ```text
-======================= 66 passed, 8 warnings in 23.30s =======================
+================== 67 passed, 1 skipped, 8 warnings in 13.39s ==================
 ```
 
 To build and validate the production frontend bundle:
@@ -284,7 +285,66 @@ npm run build
 
 ---
 
-## 📊 Summary of Implemented Requirements
+## 🔌 REST API Reference & Exercising Endpoints
+
+The FastAPI backend exposes versioned REST endpoints (`/api/v1/`) with multi-tenant session isolation:
+
+| Method | Endpoint | Description | Request Body / Params | Response |
+| :--- | :--- | :--- | :--- | :--- |
+| `GET` | `/api/v1/health` | Service health, active AI provider inspect, index statistics | None | `HealthResponse` (200) |
+| `POST` | `/api/v1/documents/upload` | **Synchronous Batch Ingestion**: Ingest up to 5 files (`.pdf`, `.docx`, `.doc`, `.txt`, `.md`, `.csv`, max 5MB each) | `multipart/form-data` (`files`) | `MultiFileUploadResponse` (201) |
+| `POST` | `/api/v1/documents/upload?background=true` | **Asynchronous Decoupled Ingestion**: Enqueues indexing into background worker, returns job tracker URLs | `multipart/form-data` (`files`), Query: `background=true` | `AsyncIngestionJobResponse` (202 Accepted) |
+| `GET` | `/api/v1/documents/jobs/{job_id}/events` | **Real-Time Telemetry Stream**: Live SSE event stream emitting file progress, stage, and completion status | Path: `job_id` | `text/event-stream` (SSE Events) |
+| `GET` | `/api/v1/documents/jobs/{job_id}` | **Job Status Snapshot**: Poll current ingestion status, processed file count, and errors | Path: `job_id` | `JobStatusResponse` (200) |
+| `POST` | `/api/v1/documents` | Create raw text/markdown document directly in knowledge base | JSON (`title`, `content`, `session_id`, `user_id`) | `DocumentResponse` (201) |
+| `GET` | `/api/v1/documents` | List indexed documents for the active tenant session | Query: `limit`, `offset`, `session_id`, `user_id`, `as_list` | `DocumentListResponse` (200) |
+| `GET` | `/api/v1/documents/{document_id}` | Inspect document details, total pages, and chunk breakdown | Path: `document_id` | `DocumentResponse` (200) |
+| `DELETE` | `/api/v1/documents/{document_id}` | Cascade purge: deletes document record, chunk metadata, and ChromaDB vectors | Path: `document_id` | Status 204 No Content |
+| `POST` | `/api/v1/ask` | 3-stage grounded question answering with reranking and citations | JSON (`question`, `session_id`, `user_id`) | `AskResponse` (200) |
+| `GET` | `/api/v1/history` | Retrieve persistent Q&A conversation and citation history for tenant session/user | Query: `session_id`, `user_id`, `limit` | `QuestionHistoryResponse` (200) |
+| `DELETE` | `/api/v1/history` | Clear Q&A conversation history for tenant session or user | Query: `session_id`, `user_id` | Status 204 No Content |
+
+### Quick cURL Examples
+
+```bash
+# 1. Check Service Health
+curl -s http://localhost:8000/api/v1/health | jq .
+
+# 2. Upload Document with Asynchronous Decoupled Ingestion (HTTP 202 Accepted)
+curl -X POST "http://localhost:8000/api/v1/documents/upload?background=true" \
+  -H "X-Session-ID: sess_demo" \
+  -F "files=@sample.pdf"
+
+# 3. Stream Real-Time Ingestion Progress over Server-Sent Events (SSE)
+curl -N "http://localhost:8000/api/v1/documents/jobs/{job_id}/events"
+
+# 4. Ask Grounded Question with Citations
+curl -X POST "http://localhost:8000/api/v1/ask" \
+  -H "Content-Type: application/json" \
+  -H "X-Session-ID: sess_demo" \
+  -d '{"question": "Summarize the primary revenue trends."}'
+
+# 5. Retrieve Q&A Conversation & Source Citation History
+curl -s "http://localhost:8000/api/v1/history?session_id=sess_demo" | jq .
+
+# 6. Clear Session Conversation History
+curl -X DELETE "http://localhost:8000/api/v1/history?session_id=sess_demo"
+```
+
+---
+
+## 🤖 AI Coding Tools Disclosure
+
+In accordance with the candidate challenge guidelines, this repository includes a dedicated disclosure document:
+👉 **[AI_USAGE.md](AI_USAGE.md)**
+
+It documents:
+1. Specific AI tools utilized (**Antigravity IDE**, Google Gemini 2.5 Flash, Gemini Embedding-2, Groq Llama 3 / GPT-OSS-120B).
+2. Key architectural influences (3-stage hybrid RAG funnel, decoupled asynchronous ingestion with SSE telemetry, enterprise 9-column context-aware logging, and secret masking).
+3. Concrete examples of AI suggestions reviewed, changed, or rejected (e.g., rejecting concurrent `asyncio.gather` file ingestion due to Gemini API rate limits and SQLite locking, redesigning blocking modal overlays into non-intrusive in-table status tracking, and normalizing RRF scores).
+4. Engineering ownership and technical accountability affirmation.
+
+---
 
 | Requirement | Implementation Details |
 |---|---|

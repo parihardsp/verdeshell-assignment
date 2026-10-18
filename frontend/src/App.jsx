@@ -21,6 +21,7 @@ import {
   setUserDisplayName,
   createNewSession,
   setSessionId,
+  recordSessionForUser,
   listUserSessions,
   loadSessionChat,
   saveSessionChat,
@@ -85,13 +86,22 @@ export default function App() {
   // 2. Persist chat messages whenever they change
   useEffect(() => {
     saveSessionChat(userId, sessionId, messages);
+    if (messages.length > 0) {
+      recordSessionForUser(userId, sessionId);
+      setAvailableSessions(listUserSessions(userId));
+    }
   }, [userId, sessionId, messages]);
 
   // 3. Fetch documents for active session
   const fetchSessionDocuments = useCallback(async () => {
     try {
       const res = await getDocuments(sessionId, userId);
-      setDocuments(res.items || []);
+      const items = res.items || [];
+      setDocuments(items);
+      if (items.length > 0) {
+        recordSessionForUser(userId, sessionId);
+        setAvailableSessions(listUserSessions(userId));
+      }
     } catch {
       setDocuments([]);
     }
@@ -124,6 +134,7 @@ export default function App() {
         sources: data.sources || [],
         latency_ms: data.latency_ms,
         confidence_score: data.confidence_score,
+        response_type: data.response_type,
       };
       setMessages([...updatedMessages, botMsg]);
     } catch (err) {
@@ -322,6 +333,8 @@ export default function App() {
     setIsSavingText(true);
     try {
       await createDocument(title, content, sessionId, userId);
+      recordSessionForUser(userId, sessionId);
+      setAvailableSessions(listUserSessions(userId));
       showToast(`Indexed article "${title}" successfully.`, "success");
       await fetchSessionDocuments();
     } catch (err) {
@@ -358,6 +371,14 @@ export default function App() {
 
   // 9. Handle new session generation
   const handleNewSession = () => {
+    // Avoid ghost sessions: if current session is already fresh and empty, reuse it
+    const hasMessages = messages.length > 0;
+    const hasDocuments = documents.length > 0;
+    if (!hasMessages && !hasDocuments) {
+      showToast(`Current session (${sessionId}) is already fresh and empty.`, "info");
+      return;
+    }
+
     const newSessId = createNewSession();
     setSessionIdState(newSessId);
     setMessages([]);

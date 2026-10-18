@@ -28,12 +28,16 @@ The backend is engineered around the principles of **Clean Architecture** and **
 |                                                         v                                                         |
 |  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐  |
 |  │                                      API ROUTER LAYER (app/api/routes.py)                                   │  |
-|  │  - POST /api/v1/documents/upload  (Batch multi-format ingestion, max 5 files, 5MB limit)                     │  |
+|  │  - POST /api/v1/documents/upload  (Batch multi-format ingestion: sync 201 or async ?background=true 202)    │  |
+|  │  - GET  /api/v1/documents/jobs/{job_id}/events (Real-time SSE telemetry stream)                             │  |
+|  │  - GET  /api/v1/documents/jobs/{job_id}        (Job status snapshot / polling fallback)                     │  |
 |  │  - POST /api/v1/documents         (Raw markdown/text article creation)                                      │  |
 |  │  - GET  /api/v1/documents         (Paginated session document inventory)                                    │  |
 |  │  - GET  /api/v1/documents/{id}    (Document inspection & chunk inspection)                                  │  |
 |  │  - DELETE /api/v1/documents/{id}  (Cascade purge: relational metadata + ChromaDB vector index)              │  |
 |  │  - POST /api/v1/ask               (3-Stage hybrid RAG pipeline with grounded citations)                     │  |
+|  │  - GET  /api/v1/history            (Paginated Q&A conversation & citation history)                          │  |
+|  │  - DELETE /api/v1/history         (Purge Q&A history for active session / user)                             │  |
 |  │  - GET  /api/v1/health            (Service health, active AI provider inspect, index counts)                │  |
 |  └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘  |
 +------------------------------------+-----------------------------------------------------+------------------------+
@@ -106,12 +110,13 @@ The backend is engineered around the principles of **Clean Architecture** and **
 
 | Component | Module Path | Layer | Key Responsibilities | Design Pattern |
 | :--- | :--- | :--- | :--- | :--- |
-| **API Router** | `app/api/routes.py` | Presentation / HTTP | Exposes REST endpoints, performs HTTP parameter validation, maps domain models to Pydantic v2 response schemas. | Controller |
+| **API Router** | `app/api/routes.py` | Presentation / HTTP | Exposes REST endpoints (/health, /documents, /upload, /jobs, /ask), validates parameters, supports sync & async SSE streaming, and maps domain models to Pydantic v2 schemas. | Controller |
 | **API Dependencies** | `app/api/dependencies.py` | Presentation / DI | Inversion-of-Control factory assembling database repositories, providers, and services. Implements singleton connection pooling. | Dependency Injection / Factory |
 | **Rate Limiter** | `app/core/rate_limiter.py` | Infrastructure / Security | Enforces client IP sliding-window rate limits (20 req / 60s), generates RFC-standard `Retry-After` headers, and automatically purges stale clients. | Sliding Window / Token Bucket |
 | **Enterprise Logging** | `app/core/logging.py` | Cross-Cutting | Injects `request_id`, `user_id`, and `session_id` into async `ContextVar` scopes; formats 9-column structured logs, manages daily date-partitioned log directories with automated 7-day retention, and scrubs secrets. | Interceptor / Filter Pipeline |
 | **Error Handling** | `app/core/exceptions.py` | Presentation / Error | Intercepts domain and framework exceptions, returning RFC 7807 problem details while shielding internal stack traces. | Exception Shielding |
 | **Document Service** | `app/services/document_service.py` | Application Service | Orchestrates batch file ingestion, storage persistence, extraction, chunking, and dual-store commit (SQLite + ChromaDB). | Facade / Orchestrator |
+| **Job Manager** | `app/services/job_manager.py` | Application Service / Telemetry | In-memory asynchronous ingestion job registry with 30-min sliding TTL eviction and non-blocking `asyncio.Queue` fan-out for real-time SSE progress events. | Publisher-Subscriber / Observer |
 | **Chat Service (RAG)** | `app/services/chat_service.py` | Application Service | High-level facade orchestrating multi-stage retrieval, reranking, synthesis, citation assembly, and audit logging. | Facade |
 | **File Validator** | `app/ingestion/validator.py` | Domain / Ingestion | Validates batch counts, file sizes, MIME types, magic headers, and computes SHA-256 digests. | Specification |
 | **File Storage** | `app/ingestion/storage.py` | Infrastructure / Storage | Manages sanitized disk storage partitioned by tenant ID, session ID, and ingestion date. | Gateway / DAO |
@@ -134,7 +139,7 @@ backend/
 │   ├── api/                         # Presentation Layer (FastAPI Routers & DI)
 │   │   ├── __init__.py              # Exports consolidated api_router
 │   │   ├── dependencies.py          # Dependency injection container & provider cache singletons
-│   │   └── routes.py                # REST API controllers (/health, /documents, /ask)
+│   │   └── routes.py                # REST API controllers (/health, /documents, /upload, /jobs, /ask, /history)
 │   │
 │   ├── core/                        # System Infrastructure & Cross-Cutting Concerns
 │   │   ├── __init__.py
@@ -176,13 +181,14 @@ backend/
 │   ├── schemas/                     # Data Transfer Objects (Pydantic v2 Models)
 │   │   ├── __init__.py              # Unified schema exports
 │   │   ├── common.py                # HealthResponse, ErrorResponse, PaginationMeta
-│   │   ├── document.py              # DocumentCreate, DocumentResponse, UploadSummary
-│   │   └── rag.py                   # AskRequest, AskResponse, SourceCitation
+│   │   ├── document.py              # DocumentCreate, DocumentResponse, MultiFileUploadResponse, AsyncIngestionJobResponse, JobStatusResponse
+│   │   └── rag.py                   # AskRequest, AskResponse, QuestionHistoryResponse, SourceCitation
 │   │
 │   ├── services/                    # Application Domain Services
 │   │   ├── __init__.py
 │   │   ├── chat_service.py          # RAGService high-level Q&A facade
 │   │   ├── document_service.py      # DocumentService ingestion & lifecycle manager
+│   │   ├── job_manager.py           # IngestionJobManager (async background job registry & SSE event bus)
 │   │   └── storage_service.py       # FileStorageService compatibility alias
 │   │
 │   └── main.py                      # ASGI entrypoint, lifespan startup/shutdown, CORS
@@ -195,14 +201,21 @@ backend/
 ├── logs/                            # Daily date-partitioned log directories (logs/YYYY-MM-DD/)
 │   └── YYYY-MM-DD/                  # application.log, error.log, access.log (7-day retention)
 │
-├── tests/                           # Automated Verification Suite (62 pytest tests)
+├── tests/                           # Automated Verification Suite (67 pytest tests)
 │   ├── conftest.py                  # Pytest async fixtures & mock provider stubs
-│   ├── test_api.py                  # REST API contract and endpoint integration tests
-│   ├── test_document_service.py     # DocumentService unit & mock ingestion tests
-│   ├── test_ingestion.py            # DocumentExtractor multi-format extraction tests
-│   ├── test_rag.py                  # Chunker, HybridRetriever, and RRF unit tests
-│   └── test_rag_pipeline.py         # Full RAG pipeline end-to-end integration tests
+│   ├── test_api_endpoints.py        # REST API endpoint integration tests
+│   ├── test_async_ingestion.py      # Decoupled background ingestion & SSE streaming tests
+│   ├── test_chunker.py              # RecursiveTextChunker windowing and offset tests
+│   ├── test_deepeval_framework.py   # DeepEval 2-Pillar RAG evaluation metrics
+│   ├── test_document_extractor.py   # Multi-format document parsing & extraction tests
+│   ├── test_file_validator.py       # File size, magic bytes, and count validation tests
+│   ├── test_multi_upload_session.py # Multi-file session persistence tests
+│   ├── test_multi_user_isolation.py # Tenant isolation across SQLite & ChromaDB
+│   ├── test_rag_pipeline_stages.py  # Hybrid retriever, RRF, Groq reranker, and synthesis tests
+│   ├── test_rate_limiter.py         # Sliding window rate limiter tests
+│   └── test_retry_and_secret_masking.py # Exponential backoff retry & secret masking tests
 │
+├── streamlit_app.py                 # Python Streamlit reference UI client
 ├── pyproject.toml                   # Project metadata and locked dependency specifications
 └── uv.lock                          # Deterministic dependency resolution lockfile
 ```

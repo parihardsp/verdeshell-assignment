@@ -91,18 +91,29 @@ def get_embedding_provider(
         return _embedding_cache[cache_key]
 
     provider: BaseEmbeddingProvider
-    if provider_type == "gemini" and settings.GEMINI_API_KEY:
-        try:
-            provider = GeminiEmbeddingProvider(
-                api_key=settings.GEMINI_API_KEY,
-                model=settings.GEMINI_EMBEDDING_MODEL,
-            )
-            _embedding_cache[cache_key] = provider
-            return provider
-        except Exception as exc:
-            logger.warning(
-                "Embedding provider initialization failed, falling back to mock | provider=gemini error=%s",
-                type(exc).__name__,
+    if provider_type == "gemini":
+        if curr_settings.GEMINI_API_KEY:
+            try:
+                provider = GeminiEmbeddingProvider(
+                    api_key=curr_settings.GEMINI_API_KEY,
+                    model=curr_settings.GEMINI_EMBEDDING_MODEL,
+                )
+                logger.info(
+                    "Embedding provider active | provider=gemini model=%s dim=3072",
+                    curr_settings.GEMINI_EMBEDDING_MODEL,
+                    extra={"phase": LogPhase.PROVIDER},
+                )
+                _embedding_cache[cache_key] = provider
+                return provider
+            except Exception as exc:
+                logger.warning(
+                    "Embedding provider initialization failed, falling back to mock | provider=gemini error=%s",
+                    type(exc).__name__,
+                    extra={"phase": LogPhase.PROVIDER},
+                )
+        else:
+            logger.info(
+                "No GEMINI_API_KEY detected in environment | using MockEmbeddingProvider (offline deterministic 384-d vectors for local evaluation)",
                 extra={"phase": LogPhase.PROVIDER},
             )
 
@@ -204,6 +215,10 @@ def get_llm_provider(
                 extra={"phase": LogPhase.PROVIDER},
             )
 
+    logger.info(
+        "No LLM API keys configured in environment | using MockLLMProvider (offline deterministic grounded synthesizer for local evaluation)",
+        extra={"phase": LogPhase.PROVIDER},
+    )
     provider = MockLLMProvider()
     _llm_cache[cache_key] = provider
     return provider
