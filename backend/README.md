@@ -1,357 +1,227 @@
-# Mini Knowledge Assistant — Backend Service
+# Enterprise Knowledge Assistant — Backend Service
 
-A production-grade, asynchronous Retrieval-Augmented Generation (RAG) backend service built with **Python 3.12**, **FastAPI**, **SQLAlchemy 2.0 (aiosqlite)**, **ChromaDB**, and **Pydantic v2**.
+An asynchronous, production-grade Retrieval-Augmented Generation (RAG) backend service built with **Python 3.12**, **FastAPI**, **SQLAlchemy 2.0 (aiosqlite)**, **ChromaDB**, **PyMuPDF / python-docx**, and **Pydantic v2**.
 
----
-
-## 1. System Overview
-
-The **Mini Knowledge Assistant Backend** ingests multi-format operational documents (`.pdf`, `.txt`, `.md`), segments them with page-level structural preservation, computes dense vector embeddings, and answers complex user questions via a 3-stage hybrid precision pipeline with grounded citations and zero hallucinations.
-
-### Key Highlights
-- **Clean Architecture & SOLID**: Strict separation between API controllers, domain services, persistence repositories, and external AI providers.
-- **3-Stage Hybrid RAG Funnel**:
-  - **Stage 1 (Dual-Channel Hybrid Retrieval)**: Parallel Dense Vector Search (ChromaDB HNSW cosine similarity) + Lexical Keyword Search (BM25L) with compound tenant scoping (`user_id` and `session_id`).
-  - **Stage 2A (Reciprocal Rank Fusion Coarse Cut)**: Cormack's Reciprocal Rank Fusion (`RRF_Score(d) = Σ [ 1 / (60 + rank_m(d)) ]`) merging dense and BM25 rank lists into a Top 15 candidate pool.
-  - **Stage 2B (Groq Neural Precision Reranker)**: High-throughput Groq LLM (`openai/gpt-oss-120b`) cross-attention scoring (0.0 to 10.0) with reasoning, pruning to the Top 3 precision chunks with graceful fallback to RRF.
-  - **Stage 3 (Grounded Synthesis)**: High-performance generation via **Google Gemini Flash Lite** (`gemini-flash-lite-latest`), **Groq** (`openai/gpt-oss-120b`), or offline **Mock LLM** with native LangSmith tracing and strict anti-hallucination prompt guardrails.
-- **Standardized Model Selection via `.env`**:
-  - **Embedding Providers (2 choices)**: `gemini` (Google Gemini 3072-dim vectors, default) or `mock` (offline 384-dim deterministic vectors).
-  - **LLM Generation Providers (3 choices)**: `gemini` (Google Gemini, default), `groq` (Groq ultra-fast Llama), or `mock` (offline synthesizer).
-  - **Reranker Providers (3 choices)**: `groq` (Fast Groq LLM reranker, default), `rrf` (Pure Reciprocal Rank Fusion), or `mock`.
-- **PyMuPDF Document Ingestion**: Multi-file batch upload (up to 5 files, 5MB each) with page-preserving text extraction and disk persistence under `data/uploads/{user_id}_{session_id}_{date}/`.
-- **DeepEval 2-Pillar Evaluation Framework**: Production quality test suite assessing Retrieval Recall, Retrieval Precision, Retrieval Relevancy, Generation Faithfulness, Hallucination, and Answer Relevancy powered by Groq.
-- **Enterprise Guardrails**:
-  - Sliding-window in-memory rate limiter on `POST /ask` (20 req / 60s per client IP) returning HTTP 429 with standard `Retry-After` headers.
-  - SHA-256 duplicate detection and payload validation.
-  - RFC 7807 compliant sanitized error shielding.
+The service ingests multi-format enterprise documentation, preserves structural and page-boundary metadata, indexes content into dual relational and vector stores, and answers user questions through a high-precision, 3-stage hybrid retrieval and grounded synthesis pipeline.
 
 ---
 
-## 2. Project Directory Structure
+## Technical Architecture & Deep Dive
 
-```text
-backend/app/
-├── api/
-│   ├── __init__.py              # Exports consolidated api_router
-│   ├── dependencies.py          # FastAPI Depends factories & startup vector hydration
-│   └── routes.py                # Consolidated REST endpoints (/health, /documents, /ask)
-│
-├── core/
-│   ├── __init__.py
-│   ├── config.py                # Pydantic v2 BaseSettings with active provider configs
-│   ├── exceptions.py            # RFC 7807 domain exception classes & global handlers
-│   ├── logging.py               # ContextVar session-scoped structured logging
-│   └── rate_limiter.py          # Sliding window token rate limiter with Retry-After
-│
-├── db/
-│   ├── __init__.py              # Unified database package exports
-│   ├── database.py              # Async engine, AsyncSessionLocal, and schema auto-migrations
-│   ├── models.py                # Declarative Base, Document, Chunk, QuestionHistory models
-│   └── repositories.py          # BaseRepository, Document, Chunk, and QuestionHistory repos
-│
-├── ingestion/
-│   ├── __init__.py              # Ingestion package exports
-│   ├── extractor.py             # DocumentExtractor (PyMuPDF parser & text decoders)
-│   ├── storage.py               # SessionFileStorageService (session/date disk partitioning)
-│   └── validator.py             # FileValidationService (SHA-256 deduplication, 5MB limits)
-│
-├── providers/
-│   ├── __init__.py              # Provider adapters package exports
-│   ├── embeddings.py            # GeminiEmbeddingProvider (3072-dim) & MockEmbeddingProvider
-│   ├── llm.py                   # LangChainLLMProvider, GroqLLMProvider, GeminiLLMProvider
-│   └── vector_store.py          # ChromaVectorStore with compound session & user scoping
-│
-├── rag/
-│   ├── __init__.py              # RAG pipeline package exports
-│   ├── chunker.py               # RecursiveTextChunker (paragraph/sentence/word splits)
-│   ├── embedder.py              # RAGEmbedder batch coordination stage
-│   ├── evaluation.py            # DeepEval 4-pillar quality benchmark framework (Groq)
-│   ├── pipeline.py              # Decoupled RAGPipeline orchestrator
-│   ├── reranker.py              # GroqLLMReranker, ReciprocalRankReranker, MockReranker
-│   ├── retriever.py             # HybridRetriever (Dense Vector + BM25L parallel retrieval)
-│   └── synthesizer.py          # GroundedSynthesizer with source citation assembly
-│
-├── schemas/
-│   ├── __init__.py              # Pydantic v2 schemas exports
-│   ├── common.py                # HealthResponse, ErrorDetail
-│   ├── document.py              # DocumentCreate, DocumentResponse, MultiFileUploadResponse
-│   └── rag.py                   # AskRequest, AskResponse, SourceCitation
-│
-├── services/
-│   ├── __init__.py              # Domain services package exports
-│   ├── chat_service.py          # High-level Q&A facade (aliased to RAGService)
-│   └── document_service.py      # Ingestion, validation, chunking, and persistence orchestration
-│
-└── main.py                      # FastAPI lifespan startup, CORS, middleware, router mount
-```
+> [!NOTE]
+> For comprehensive technical documentation, including end-to-end request–response sequence diagrams, phase-wise ingestion and retrieval flows, concurrency models, and an enterprise **100,000+ concurrent user scalability roadmap**, please refer to the dedicated architecture specification:
+> 
+> **[Backend Architecture & Technical Design Specification](ARCHITECTURE.md)**
 
 ---
 
-## 3. End-to-End System Flows
+## Key Capabilities & Highlights
 
-### 3.1 Document Ingestion Flow (Write Path)
-
-Document chunking and vector embedding computation occur strictly at **Upload Time** to guarantee sub-second read queries:
-
-```text
-[Client / Streamlit]
-       │  POST /documents/upload (Multipart: up to 5 files, session_id, user_id)
-       ▼
-[validator.py: FileValidationService]
-       │  Enforce batch limit (<= 5), size limit (<= 5MB), allowed extensions (.pdf/.txt/.md)
-       │  Calculate SHA-256 content hash for deduplication
-       ▼
-[storage.py: SessionFileStorageService]
-       │  Persist sanitized raw files to disk: data/uploads/{user_id}_{session_id}_{date}/
-       ▼
-[extractor.py: DocumentExtractor]
-       │  PyMuPDF extracts page-by-page text preserving ExtractedPage(page_number, text)
-       ▼
-[chunker.py: RecursiveTextChunker]
-       │  Recursive fallback splitting (\n\n -> \n -> sentence -> word)
-       │  Output: List[TextChunk] with char offsets and page numbers
-       ▼
-[embeddings.py: GeminiEmbeddingProvider]
-       │  Batch vectorization via Google Gemini models/gemini-embedding-2 (dim: 3072)
-       ▼
-[database.py & repositories.py] ───► SQLite (data/knowledge_base.db):
-       │                             - Persist Document row
-       │                             - Bulk insert Chunk rows with JSON embeddings
-       ▼
-[vector_store.py: ChromaVectorStore]
-       │  Upsert IndexedChunk records into ChromaDB HNSW collection (data/chroma_db/)
-       ▼
-[Response] ──► MultiFileUploadResponse (session_id, user_id, processed files, page & chunk counts)
-```
+- **Clean Architecture & SOLID Design**: Strict decoupling between presentation routers, application services, domain models, and external AI provider adapters (Ports & Adapters).
+- **Multi-Format Enterprise Ingestion**: Cascading, non-blocking extraction engine supporting `.pdf`, `.docx`, `.doc`, `.txt`, `.md`, and `.csv` files with character-offset tracking and page-boundary preservation.
+- **Asynchronous Decoupled Ingestion Pipeline (HTTP 202 Accepted)**:
+  - Batch uploads immediately return `HTTP 202 Accepted` with a `job_id`, offloading extraction, chunking, and embedding to background worker tasks.
+  - **Dual-Channel Telemetry**: Server-Sent Events (`GET /api/v1/documents/jobs/{job_id}/events`) stream real-time progress (`stage`, `percent`, `current_file`, `message`) with an automatic JSON snapshot fallback (`GET /api/v1/documents/jobs/{job_id}`).
+  - **In-Memory Job Manager with TTL**: Thread-safe singleton managing active jobs with 30-minute sliding TTL eviction.
+  - **Individual Failure Isolation**: Per-file `try...except` boundaries ensure that an unreadable or corrupt file does not abort the remaining valid documents in a batch.
+- **3-Stage Hybrid Precision Funnel**:
+  - **Stage 1 (Dual-Channel Hybrid Retrieval)**: Parallel Dense Vector Search (ChromaDB HNSW, 3072-d) and Lexical Keyword Search (BM25L) scoped strictly to `{user_id, session_id}` tenants.
+  - **Stage 2A (Reciprocal Rank Fusion)**: Rank-based fusion using Cormack's RRF (`RRF_Score(d) = Σ [ 1 / (60 + rank_m(d)) ]`) to merge dense and lexical candidates into a balanced Top 15 pool.
+  - **Stage 2B (Neural Cross-Attention Reranking)**: High-throughput Groq LLM cross-encoder scoring (0.0 to 10.0) with reasoning, pruning candidates to the Top 3 highest-precision chunks with automatic RRF fallback.
+  - **Stage 3 (Grounded Synthesis)**: High-performance answer generation via Google Gemini Flash Lite or Groq with strict anti-hallucination prompt guardrails and source citations.
+- **Asynchronous Concurrency & Scalability**:
+  - SQLite Write-Ahead Logging (`WAL` mode) with `PRAGMA synchronous = NORMAL` and `busy_timeout = 5000` for lock-free concurrent reads during writes.
+  - Multi-tenant composite B-Tree indexes on `documents`, `chunks`, and `question_history` tables.
+  - Non-blocking ASGI event loop: compute-heavy document extraction and vector indexing are offloaded to background worker threads via `asyncio.to_thread()`.
+  - In-memory singleton connection pooling and provider caching to reuse persistent HTTP/2 and TCP connections.
+- **Enterprise Guardrails & Security**:
+  - Sliding-window in-memory rate limiter on `POST /ask` (20 req / 60s per client IP) with automatic stale client memory eviction.
+  - **Standardized Enterprise Logging Strategy**: Minimal, structured 9-column format (`Timestamp | Level | Phase | request_id | user_id | session_id | Module | Message | Metadata`), async `contextvars` request tracing, 17 standardized lifecycle phases, daily date-partitioned storage (`logs/YYYY-MM-DD/`) with automated 7-day retention, and zero-secret credential redaction.
+  - SHA-256 content deduplication and strict file payload validation.
+  - RFC 7807 problem details error shielding.
+- **Rigorous Test Coverage**: 100% pass rate across **66 comprehensive unit, integration, and benchmark tests**.
 
 ---
 
-### 3.2 RAG Q&A Execution Flow (Read Path)
+## Core Technology Stack
 
-```text
-[Client / Streamlit]
-       │  POST /ask {"question": "...", "session_id": "sess_1", "user_id": "usr_1"}
-       │  Headers: X-User-ID: usr_1, X-Session-ID: sess_1
-       ▼
-[Middleware: user_session_context_middleware]
-       │  Extract user_id & session_id, set ContextVars for structured logging: [user_id:session_id]
-       ▼
-[rate_limiter.py: SlidingWindowRateLimiter]
-       │  Check client IP: 20 requests per 60s window (returns 429 Retry-After if exceeded)
-       ▼
-[pipeline.py: RAGPipeline]
-       │
-       ├─► [STAGE 1: DUAL-CHANNEL HYBRID RETRIEVAL] (retriever.py: HybridRetriever)
-       │      │  Channel 1: Dense Vector Retrieval (ChromaDB HNSW, Top 15, threshold >= 0.20)
-       │      │  Channel 2: Lexical Keyword Retrieval (BM25L Inverted Index, Top 15)
-       │      │  Parallel execution via asyncio.gather -> Merged Pool (up to 30 chunks)
-       │      ▼  Tags each candidate with channel origin: "dense", "bm25", or "hybrid"
-       │
-       ├─► [STAGE 2A: RRF COARSE CUT] (reranker.py: ReciprocalRankReranker)
-       │      │  Dense rank + Lexical rank fusion:
-       │      │  RRF_Score(d) = Σ [ 1 / (60 + rank_m(d)) ]
-       │      ▼  Selects Top 15 candidates for neural evaluation
-       │
-       ├─► [STAGE 2B: GROQ NEURAL PRECISION RERANKER] (reranker.py: GroqLLMReranker)
-       │      │  Zero-temperature joint cross-attention via Groq LLM (openai/gpt-oss-120b)
-       │      │  Assigns calibrated relevance score (0.0 to 10.0) with reasoning
-       │      │  Selects final Top 3 precision chunks (with automatic fallback to RRF)
-       │      ▼
-       │
-       ├─► [STAGE 3: GROUNDED SYNTHESIS] (synthesizer.py: GroundedSynthesizer)
-       │      │  Modular prompt assembly via app.rag.prompts.synthesis_prompts
-       │      │  Enforce Pydantic schema: GroundedSynthesisOutput (answer, has_sufficient_context, cited_chunk_indices)
-       │      │  Zero-hallucination gating: Returns clean refusal when has_sufficient_context=False
-       │      │  Precision citations: Only cited_chunk_indices are attached to SourceCitation objects
-       │      │  Invoke Gemini Flash Lite (gemini-flash-lite-latest) with LangSmith tracing
-       │      ▼  Attach SourceCitation objects (doc_id, title, page_number, channel, reranker_score)
-       │
-       └─► [AUDIT LOGGING] (repositories.py: QuestionHistoryRepository)
-              │  Record question, answer, citations, latency_ms, client_ip in SQLite
-              ▼
-[Response] ──► AskResponse (answer, sources with citations, session_id, latency_ms)
-```
+| Layer | Technology | Version | Purpose |
+| :--- | :--- | :--- | :--- |
+| **Language & Runtime** | Python | 3.12+ | High-performance asynchronous execution runtime |
+| **Package Manager** | `uv` (Astral) | Latest | Deterministic, high-speed virtual environments and lockfiles |
+| **Web Framework** | FastAPI | 0.115+ | High-throughput ASGI web framework with OpenAPI validation |
+| **ASGI Web Server** | Uvicorn | 0.34+ | Asynchronous server implementation |
+| **Data Validation** | Pydantic | v2.10+ | Strict type validation, settings management, and DTO schemas |
+| **Relational ORM** | SQLAlchemy | 2.0+ (aiosqlite) | Async relational persistence with SQLite WAL mode |
+| **Vector Database** | ChromaDB | 0.6+ | Local and persistent HNSW dense vector indexing |
+| **Document Parsing** | PyMuPDF / python-docx | 1.25+ / 1.1+ | Multi-tier extraction (PDF, DOCX, DOC, TXT, MD, CSV) |
+| **AI Foundation Models** | Google Gemini / Groq | Latest | 3072-d embeddings, neural reranking, and grounded synthesis |
+| **Evaluation Framework**| DeepEval | 2.5+ | Production RAG evaluation across recall, precision, and faithfulness |
+| **Testing Suite** | Pytest / Pytest-Asyncio| 8.3+ | Automated async unit and integration verification |
 
 ---
 
-## 4. DeepEval 2-Pillar Evaluation Framework & Golden Dataset
+## Quickstart & Setup Guide
 
-Located in `app/rag/evaluation.py` and `scripts/run_rag_evaluation.py`, the evaluation harness verifies both sides of the RAG pipeline using DeepEval's RAG Triad metrics:
+### 1. Prerequisites
+- **Python 3.12+**
+- **uv** package manager ([Install uv](https://docs.astral.sh/uv/))
 
-```text
-+------------------------------------------------------------------------+
-|             THE 2-PILLAR PRODUCTION RAG EVALUATION FRAMEWORK           |
-+------------------------------------------------------------------------+
-| PILLAR 1: RETRIEVAL QUALITY (DeepEval)                                 |
-| - ContextualRecallMetric: Did we retrieve all ground truth facts?      |
-| - ContextualPrecisionMetric: Are the most relevant chunks at the top?  |
-| - ContextualRelevancyMetric: Signal-to-noise ratio in retrieved text   |
-+------------------------------------------------------------------------+
-| PILLAR 2: GENERATION QUALITY (DeepEval)                                |
-| - FaithfulnessMetric: Is the answer 100% grounded in retrieved text?   |
-| - HallucinationMetric: Did the LLM inject external ungrounded facts?   |
-| - AnswerRelevancyMetric: Does the answer directly address the user?    |
-+------------------------------------------------------------------------+
-```
-
-### 4.1 Canonical Golden Dataset
-The evaluation harness includes a curated `GOLDEN_DATASET` (encapsulated as a DeepEval `EvaluationDataset`) covering 4 critical enterprise RAG scenarios:
-
-| # | Scenario | Query | Ground Truth Focus |
-|---|---|---|---|
-| **1** | `policy_clause_lookup` | Uptime & penalty-free contract termination | Clause 9.1: 45 days written notice if uptime < 99.5% for 2 consecutive quarters |
-| **2** | `multi_constraint_temporal` | Scheduled maintenance & patch notice | 2nd Saturday 02:00-06:00 UTC, 2-hour emergency patch notification |
-| **3** | `compliance_governance` | Data residency & certification | EU-West (Frankfurt) & US-East (Virginia), ISO-27001 certified |
-| **4** | `zero_hallucination_refusal` | Support ticket 15-minute response fee | Refusal: Knowledge base does not contain monetary penalty fees for response times |
-
-### 4.2 How to Configure & Run the Evaluation Benchmark
-
-The evaluation benchmark mode and model selection are streamlined **directly in `.env`** and can be customized or overridden via CLI flags:
-
-```env
-# In .env:
-# Switch between 'live' (real Groq LLM & Gemini embeddings) or 'mock' (offline deterministic, 0 tokens)
-EVALUATION_MODE=live
-
-# Unified model used across the evaluation suite for both extractor synthesis and DeepEval judging
-DEEPEVAL_MODEL=qwen/qwen3.8-27b
-```
-
-Running the benchmark runner (ensure you are in the `backend` directory):
-
+### 2. Environment Configuration
+From the repository root, copy the environment template:
 ```bash
-cd backend
-
-# 1. Run using .env configuration (defaults to EVALUATION_MODE=live and DEEPEVAL_MODEL=qwen/qwen3.8-27b):
-uv run python scripts/run_rag_evaluation.py
-
-# 2. Explicitly force offline mock mode (no external API calls, instantaneous):
-uv run python scripts/run_rag_evaluation.py --mock
-
-# 3. Explicitly force live benchmark against Groq & Gemini:
-uv run python scripts/run_rag_evaluation.py --live
-
-# 4. Override the unified extractor/judge model on-the-fly:
-uv run python scripts/run_rag_evaluation.py --live --model qwen/qwen3.8-27b
-
-# 5. Filter by metric subset (generation or retrieval) and export report to JSON:
-uv run python scripts/run_rag_evaluation.py --metrics generation --output eval_report.json
-
-# 6. Run automated test suite verifying evaluation framework (all 48 tests pass):
-uv run pytest tests/test_deepeval_framework.py
+cp .env.example .env
 ```
 
----
-
-## 5. Quickstart & Installation
-
-### 5.1 Prerequisites
-- Python 3.12+
-- `uv` package manager ([Install uv](https://docs.astral.sh/uv/))
-
-### 5.2 Environment Configuration
-Copy `.env.example` to `.env` in the repository root:
-
-```bash
-cp ../.env.example ../.env
-```
-
-Ensure active providers in `.env`:
+Ensure active credentials and model choices are configured in `.env`:
 ```ini
-# Standardized Model Selection
+# Embedding Configuration
 EMBEDDING_PROVIDER=gemini
 GEMINI_EMBEDDING_MODEL=models/gemini-embedding-2
 
+# LLM Synthesis Configuration
 LLM_PROVIDER=gemini
 GEMINI_MODEL=gemini-flash-lite-latest
 
+# Reranker Configuration
 RERANKER_TYPE=groq
 GROQ_RERANKER_MODEL=openai/gpt-oss-120b
 RETRIEVAL_TOP_K=15
 FINAL_TOP_N=3
 
-# API Keys
-GEMINI_API_KEY=your_gemini_api_key_here
-GROQ_API_KEY=your_groq_api_key_here
+# External API Credentials
+GEMINI_API_KEY=your_gemini_api_key
+GROQ_API_KEY=your_groq_api_key
 
-# Vector Store & Paths
-DATABASE_URL=sqlite+aiosqlite:///data/knowledge_base.db
-CHROMA_PERSIST_DIR=data/chroma_db
-UPLOAD_DIR=data/uploads
+# Distributed Observability (Optional)
+LANGCHAIN_TRACING_V2=true
+LANGCHAIN_ENDPOINT=https://aws.api.smith.langchain.com
+LANGCHAIN_API_KEY=your_langsmith_api_key
+LANGCHAIN_PROJECT=Enterprise-RAG-Assistant
 ```
 
-### 5.3 Install Dependencies
+### 3. Run the Backend Service
+From the `backend/` directory:
 ```bash
 cd backend
-uv sync
-```
-
-### 5.4 Run the Backend Service
-```bash
 uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
-- Interactive Swagger UI: [http://localhost:8000/docs](http://localhost:8000/docs)
-- Interactive ReDoc: [http://localhost:8000/redoc](http://localhost:8000/redoc)
 
----
+The service will start on `http://localhost:8000`.
 
-## 6. Testing
+- **Interactive Swagger UI**: `http://localhost:8000/docs`
+- **ReDoc API Documentation**: `http://localhost:8000/redoc`
+- **Service Health Check**: `http://localhost:8000/api/v1/health`
 
-Run the automated test suite covering unit tests, integration tests, rate limiting, and DeepEval evaluation metrics:
-
+### 4. Running the Automated Test Suite
+Execute the complete test suite (62 unit and integration tests):
 ```bash
+cd backend
 uv run pytest
 ```
 
-Output:
+Expected output:
 ```text
-======================== 38 passed, 8 warnings in 3.11s ========================
+======================= 62 passed, 8 warnings in 20.15s =======================
 ```
 
 ---
 
-## 7. API Reference (cURL Examples)
+## Configuration Reference
 
-### Health Check
-```bash
-curl -s http://localhost:8000/health | jq
+The application is configured via environment variables mapped by Pydantic v2 `BaseSettings` in `app/core/config.py`:
+
+| Variable | Default Value | Description |
+| :--- | :--- | :--- |
+| `APP_NAME` | `Mini Knowledge Assistant` | Name of the application service |
+| `API_V1_STR` | `/api/v1` | URL prefix for REST API endpoints |
+| `DATABASE_URL` | `sqlite+aiosqlite:///./data/knowledge_assistant.db` | SQLAlchemy async database connection URI |
+| `CHROMA_PERSIST_DIRECTORY` | `./data/chroma_db` | Persistent filesystem directory for ChromaDB vector indexes |
+| `EMBEDDING_PROVIDER` | `gemini` | Active embedding provider (`gemini` or `mock`) |
+| `GEMINI_EMBEDDING_MODEL` | `models/gemini-embedding-2` | Google Gemini dense vector model (3072 dimensions) |
+| `LLM_PROVIDER` | `gemini` | Active LLM synthesis provider (`gemini`, `groq`, or `mock`) |
+| `GEMINI_MODEL` | `gemini-flash-lite-latest` | Google Gemini synthesis model |
+| `RERANKER_TYPE` | `groq` | Active reranker provider (`groq`, `rrf`, or `mock`) |
+| `GROQ_RERANKER_MODEL` | `openai/gpt-oss-120b` | High-throughput Groq model for neural cross-attention |
+| `RETRIEVAL_TOP_K` | `15` | Number of candidate chunks retrieved per channel in Stage 1 |
+| `FINAL_TOP_N` | `3` | Number of high-precision chunks passed to Stage 3 synthesis |
+| `CHUNK_SIZE` | `800` | Target chunk character count |
+| `CHUNK_OVERLAP` | `150` | Overlap character count between consecutive chunks |
+| `RATE_LIMIT_REQUESTS` | `20` | Maximum allowed requests per client IP per window |
+| `RATE_LIMIT_WINDOW_SECONDS` | `60` | Sliding window duration in seconds |
+
+---
+
+## REST API Reference
+
+All API routes require or support multi-tenant session scoping via the `X-Session-ID` and `X-User-ID` headers.
+
+| Method | Endpoint | Description | Request Body / Params | Response |
+| :--- | :--- | :--- | :--- | :--- |
+| `GET` | `/api/v1/health` | Service health, active AI provider inspect, and index statistics | None | `HealthResponse` (200) |
+| `POST` | `/api/v1/documents/upload` | Batch multi-format document upload (PDF, DOCX, DOC, TXT, MD, CSV) | `multipart/form-data` (`files`) | `UploadSummary` (200) |
+| `POST` | `/api/v1/documents` | Create raw text/markdown document directly | JSON (`title`, `content`) | `DocumentResponse` (201) |
+| `GET` | `/api/v1/documents` | List indexed documents for the active tenant session | Query: `skip`, `limit` | List of `DocumentResponse` (200) |
+| `GET` | `/api/v1/documents/{id}` | Inspect document details and chunk breakdown | Path: `id` | `DocumentResponse` (200) |
+| `DELETE` | `/api/v1/documents/{id}` | Purge document and remove all associated vectors | Path: `id` | Status 204 No Content |
+| `POST` | `/api/v1/ask` | 3-stage grounded question answering with citations | JSON (`question`, `session_id`) | `AskResponse` (200) |
+
+---
+
+## Standardized Enterprise Logging & Observability
+
+The backend incorporates a unified, non-intrusive logging architecture:
+
+- **Standard 9-Column Format**:
+  ```text
+  Timestamp | Level | Phase | request_id | user_id | session_id | Module | Message | Metadata
+  ```
+  *Example:*
+  ```text
+  2026-10-18 16:35:54.723 | INFO | RETRIEVAL | req_f293070c | usr_alice | sess_summit | app.rag.retriever | Hybrid retrieval completed | dense=1 bm25=1 merged=1 overlap=1 latency_ms=5.8
+  ```
+- **Context Injection**: Non-blocking `contextvars` automatically inject `request_id`, `user_id`, and `session_id` into every coroutine. Incoming `X-Request-ID` headers are propagated, or auto-generated `req_*` IDs are assigned.
+- **17 Standard Phases**: `STARTUP`, `REQUEST`, `AUTH`, `VALIDATION`, `INGESTION`, `EXTRACTION`, `CHUNKING`, `EMBEDDING`, `RETRIEVAL`, `RERANKING`, `GENERATION`, `DATABASE`, `VECTOR_STORE`, `PROVIDER`, `RESPONSE`, `BACKGROUND`, `SHUTDOWN`.
+- **Date-Partitioned Daily Storage with 7-Day Retention**:
+  ```text
+  logs/
+  └── YYYY-MM-DD/
+      ├── application.log   # General application lifecycle events (INFO+)
+      ├── error.log         # Recoverable warnings and exceptions (WARNING+)
+      └── access.log        # HTTP request metrics, latency, and status codes
+  ```
+  Older daily folders exceeding 7 days are automatically purged on startup and rollover.
+- **Zero-Secret & Zero-Snippet Redaction**: `SecretMaskingFilter` scrubs API keys (Google, Groq, OpenAI, Anthropic, LangSmith) and bearer tokens. Raw document content is strictly barred from log statements.
+
+---
+
+## High-Level Directory Structure
+
+```text
+backend/
+├── app/
+│   ├── api/             # REST API routers, endpoints, and dependency injection factories
+│   ├── core/            # Config, 9-column logging, exception handlers, rate limiting
+│   ├── db/              # SQLAlchemy models, SQLite WAL database, and repositories
+│   ├── ingestion/       # DocumentExtractor, file validation, and partitioned storage
+│   ├── providers/       # Gemini, Groq, ChromaDB, and Mock adapter implementations
+│   ├── rag/             # Chunker, HybridRetriever, 2-Stage Rerankers, and Synthesizer
+│   ├── schemas/         # Pydantic v2 schemas for requests, responses, and citations
+│   ├── services/        # High-level domain facades (DocumentService, ChatService, IngestionJobManager)
+│   └── main.py          # ASGI application entry point and lifespan event handlers
+│
+├── data/                # Local persistent data directory (SQLite WAL and ChromaDB)
+├── logs/                # Date-partitioned persistent log storage (logs/YYYY-MM-DD/)
+├── tests/               # 66 automated unit, integration, and benchmark tests
+├── pyproject.toml       # Project dependencies and tool configurations
+└── uv.lock              # Deterministic package lockfile
 ```
 
-### Direct Article Ingestion (JSON)
-```bash
-curl -s -X POST http://localhost:8000/documents \
-  -H "Content-Type: application/json" \
-  -H "X-User-ID: usr_1001" \
-  -H "X-Session-ID: sess_prod_01" \
-  -d '{
-    "title": "Corporate Leave Policy",
-    "content": "Full-time employees receive 25 days of annual paid leave.",
-    "session_id": "sess_prod_01",
-    "user_id": "usr_1001"
-  }' | jq
-```
+---
 
-### Multi-File Upload
-```bash
-curl -s -X POST http://localhost:8000/documents/upload \
-  -H "X-User-ID: usr_1001" \
-  -H "X-Session-ID: sess_prod_01" \
-  -F "files=@/path/to/handbook.pdf" \
-  -F "files=@/path/to/faq.txt" \
-  -F "session_id=sess_prod_01" \
-  -F "user_id=usr_1001" | jq
-```
+## Documentation Links
 
-### Ask Grounded Question
-```bash
-curl -s -X POST http://localhost:8000/ask \
-  -H "Content-Type: application/json" \
-  -H "X-User-ID: usr_1001" \
-  -H "X-Session-ID: sess_prod_01" \
-  -d '{
-    "question": "How many days of paid leave do employees receive?",
-    "session_id": "sess_prod_01",
-    "user_id": "usr_1001"
-  }' | jq
-```
+For deeper architectural inquiries and engineering blueprints:
+- **[Backend Architecture Specification](ARCHITECTURE.md)**: Exhaustive technical analysis of request lifecycles, concurrency patterns, and the 100K+ concurrent user scaling roadmap.
+- **[System Architecture (Root)](../ARCHITECTURE.md)**: Global platform architecture covering both React frontend and FastAPI backend.
+- **[Project README (Root)](../README.md)**: Global repository overview, installation, and deployment instructions.
