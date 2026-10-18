@@ -6,11 +6,12 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.api.dependencies import (
-    get_db,
     get_embedding_provider,
     get_llm_provider,
     get_vector_store,
 )
+from app.db.database import get_db, get_session_factory
+
 from app.core.rate_limiter import global_rate_limiter
 from app.db.models import Base
 from app.main import app
@@ -65,6 +66,7 @@ async def async_client(db_session: AsyncSession) -> AsyncClient:
         yield db_session
 
     app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_session_factory] = lambda: TestSessionLocal
     app.dependency_overrides[get_vector_store] = lambda: test_vector_store
     app.dependency_overrides[get_embedding_provider] = lambda: test_embedding_provider
     app.dependency_overrides[get_llm_provider] = lambda: test_llm_provider

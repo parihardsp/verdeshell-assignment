@@ -6,11 +6,14 @@ Includes BaseRetriever, RetrievedChunk, and VectorRetriever.
 import logging
 import re
 import sys
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 from langsmith import traceable
+from rank_bm25 import BM25L
 
+from app.core.logging import LogPhase
 from app.providers.embeddings import BaseEmbeddingProvider
 from app.providers.vector_store import BaseVectorStore
 
@@ -55,7 +58,7 @@ class BaseRetriever(ABC):
 
 
 class VectorRetriever(BaseRetriever):
-    """Dense vector retriever using ChromaDB store with session and user scoping."""
+    """Dense vector retriever using vector store provider with session and user scoping."""
 
     def __init__(
         self,
@@ -74,17 +77,8 @@ class VectorRetriever(BaseRetriever):
         top_k: int = 5,
         threshold: float = 0.20,
     ) -> list[RetrievedChunk]:
-        """Generate query embedding and query vector store with session and user isolation."""
+        start_time = time.perf_counter()
         provider_name = self.embedding_provider.__class__.__name__
-        logger.info(
-            "[CHANNEL 1: DENSE RETRIEVAL] Provider: %s | Query: '%s' | User: '%s' | Session: '%s' | top_k=%d | threshold=%.2f",
-            provider_name,
-            query,
-            user_id,
-            session_id,
-            top_k,
-            threshold,
-        )
 
         query_embedding = await self.embedding_provider.embed_text(query)
         raw_results = await self.vector_store.search(
@@ -115,7 +109,15 @@ class VectorRetriever(BaseRetriever):
                 )
             )
 
-        logger.info("[CHANNEL 1: DENSE RESULT] Found %d candidate chunk(s).", len(retrieved))
+        latency_ms = (time.perf_counter() - start_time) * 1000
+        logger.info(
+            "Dense vector retrieval completed | provider=%s top_k=%d matches=%d latency_ms=%.1f",
+            provider_name,
+            top_k,
+            len(retrieved),
+            latency_ms,
+            extra={"phase": LogPhase.RETRIEVAL},
+        )
         return retrieved
 
 
@@ -268,24 +270,9 @@ class BM25Retriever(BaseRetriever):
         top_k: int = 5,
         threshold: float = 0.0,
     ) -> list[RetrievedChunk]:
-        """Execute BM25 lexical keyword retrieval over scoped chunks."""
-        from rank_bm25 import BM25L
-
-        logger.info(
-            "[CHANNEL 2: BM25 LEXICAL RETRIEVAL] Query: '%s' | User: '%s' | Session: '%s' | top_k=%d",
-            query,
-            user_id,
-            session_id,
-            top_k,
-        )
-
+        start_time = time.perf_counter()
         all_chunks = await self.vector_store.get_all_chunks(session_id=session_id, user_id=user_id)
         if not all_chunks:
-            logger.info(
-                "[CHANNEL 2: BM25] No chunks found in scope (session='%s', user='%s').",
-                session_id,
-                user_id,
-            )
             return []
 
         tokenized_corpus = [self._tokenize(c.content) for c in all_chunks]
@@ -297,7 +284,7 @@ class BM25Retriever(BaseRetriever):
             bm25 = BM25L(tokenized_corpus)
             scores = bm25.get_scores(tokenized_query)
         except Exception as exc:
-            logger.warning("[CHANNEL 2: BM25] BM25 indexing failed (%s). Returning empty.", exc)
+            logger.warning("BM25 scoring failed, returning empty | error=%s", type(exc).__name__, extra={"phase": LogPhase.RETRIEVAL})
             return []
 
         scored_pairs = []
@@ -328,9 +315,13 @@ class BM25Retriever(BaseRetriever):
                 )
             )
 
+        latency_ms = (time.perf_counter() - start_time) * 1000
         logger.info(
-            "[CHANNEL 2: BM25 RESULT] Found %d lexical candidate chunk(s).",
+            "Lexical retrieval completed | top_k=%d matches=%d latency_ms=%.1f",
+            top_k,
             len(retrieved),
+            latency_ms,
+            extra={"phase": LogPhase.RETRIEVAL},
         )
         return retrieved
 
@@ -363,10 +354,7 @@ class HybridRetriever(BaseRetriever):
         """Execute parallel Dense Vector + BM25 Lexical retrieval and merge candidate pools."""
         import asyncio
 
-        logger.info(
-            "[STAGE 1: HYBRID RETRIEVAL] Launching parallel Dense Vector + BM25 Lexical retrieval for query: '%s'...",
-            query,
-        )
+        start_time = time.perf_counter()
 
         dense_task = self.dense_retriever.retrieve(
             query=query,
@@ -407,12 +395,15 @@ class HybridRetriever(BaseRetriever):
                 candidate_map[c.chunk_id] = c
 
         merged = list(candidate_map.values())
+        latency_ms = (time.perf_counter() - start_time) * 1000
         logger.info(
-            "[STAGE 1: HYBRID CANDIDATE POOL] Merged %d unique candidate(s) (Dense: %d, BM25: %d, Overlap in Both: %d).",
-            len(merged),
+            "Hybrid retrieval completed | dense=%d bm25=%d merged=%d overlap=%d latency_ms=%.1f",
             len(dense_results),
             len(lexical_results),
+            len(merged),
             both_count,
+            latency_ms,
+            extra={"phase": LogPhase.RETRIEVAL},
         )
         return merged
 

@@ -36,13 +36,16 @@ engine: AsyncEngine = create_async_engine(
     connect_args={"check_same_thread": False} if "sqlite" in db_url else {},
 )
 
-# Enforce foreign key constraints in SQLite
+# Enforce foreign keys, WAL concurrency mode, and busy timeout in SQLite
 if "sqlite" in db_url:
 
     @event.listens_for(engine.sync_engine, "connect")
     def set_sqlite_pragma(dbapi_connection, connection_record):
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA busy_timeout=5000")
         cursor.close()
 
 
@@ -53,6 +56,12 @@ AsyncSessionLocal = async_sessionmaker(
     autocommit=False,
     autoflush=False,
 )
+
+
+def get_session_factory() -> async_sessionmaker[AsyncSession]:
+    """Dependency returning the configured async session factory."""
+    return AsyncSessionLocal
+
 
 
 def _migrate_sqlite_schema(sync_conn):
@@ -111,6 +120,20 @@ def _migrate_sqlite_schema(sync_conn):
                 cursor.execute(
                     "ALTER TABLE question_history ADD COLUMN user_id VARCHAR(64) DEFAULT 'default_user' NOT NULL"
                 )
+
+        # Composite indexes for high-throughput multi-tenant queries
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS ix_documents_tenant_session ON documents (user_id, session_id)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS ix_chunks_tenant_session ON chunks (user_id, session_id)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS ix_chunks_doc_index ON chunks (document_id, chunk_index)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS ix_query_history_tenant_session ON question_history (user_id, session_id)"
+        )
     finally:
         cursor.close()
 

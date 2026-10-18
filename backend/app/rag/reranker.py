@@ -8,10 +8,12 @@ RRF_Score(d) = Σ [ 1 / (k + rank_m(d)) ] with k = 60.
 import logging
 import re
 import sys
+import time
 from abc import ABC, abstractmethod
 
 from langsmith import traceable
 
+from app.core.logging import LogPhase
 from app.rag.prompts.reranker_prompts import (
     build_reranker_passages_text,
     build_reranker_prompt,
@@ -75,15 +77,7 @@ class ReciprocalRankReranker(BaseReranker):
         top_n: int = 3,
     ) -> list[RetrievedChunk]:
         """Compute hybrid RRF scores and return top_n precision-boosted chunks."""
-        if not candidates:
-            return []
-
-        logger.info(
-            "[STAGE 2: RERANKING] Applying Reciprocal Rank Fusion (k=%d) to %d candidate chunk(s)...",
-            self.rrf_k,
-            len(candidates),
-        )
-
+        start_time = time.perf_counter()
         # 1. Dense Ranking
         dense_sorted = sorted(
             candidates,
@@ -123,24 +117,15 @@ class ReciprocalRankReranker(BaseReranker):
             c.rrf_score = rrf_scores[c.chunk_id]
 
         selected = reranked[:top_n]
+        latency_ms = (time.perf_counter() - start_time) * 1000
         logger.info(
-            "[RERANKING: RRF RESULT] Selected top-%d chunk(s) for grounded synthesis context:",
+            "RRF reranking completed | candidates=%d selected=%d k=%d latency_ms=%.1f",
+            len(candidates),
             len(selected),
+            self.rrf_k,
+            latency_ms,
+            extra={"phase": LogPhase.RERANKING},
         )
-        for rank, c in enumerate(selected, 1):
-            clean_snippet = c.content[:85].replace("\n", " ").strip()
-            channel = getattr(c, "retrieval_channel", "dense")
-            logger.info(
-                '   ├─ Rank #%d: [chunk: %s | channel: %s] RRF Score: %.6f (Dense Rank: #%d, Lexical Rank: #%d) | "%s..."',
-                rank,
-                c.chunk_id,
-                channel,
-                rrf_scores[c.chunk_id],
-                dense_ranks[c.chunk_id],
-                lexical_ranks[c.chunk_id],
-                clean_snippet,
-            )
-
         return selected
 
 
@@ -192,16 +177,13 @@ class GroqLLMReranker(BaseReranker):
         pool = rrf_fused[: self.max_candidates]
 
         if not self.groq_api_key:
-            logger.warning("[GROQ RERANKER] GROQ_API_KEY is not set. Returning RRF fusion ranks.")
+            logger.warning(
+                "Missing API key, returning RRF fusion ranks | provider=groq",
+                extra={"phase": LogPhase.RERANKING},
+            )
             return pool[:top_n]
 
-        logger.info(
-            "[STAGE 2B: GROQ RERANKING] Scoring %d candidate passage(s) via Groq LLM ('%s') for query: '%s'...",
-            len(pool),
-            self.model,
-            query,
-        )
-
+        start_time = time.perf_counter()
         try:
             import json
 
@@ -279,34 +261,24 @@ class GroqLLMReranker(BaseReranker):
                     groq_ranked_candidates.append(c)
 
             final_selected = groq_ranked_candidates[:top_n]
+            latency_ms = (time.perf_counter() - start_time) * 1000
 
             logger.info(
-                "[STAGE 2B: GROQ RERANKER RESULT] Successfully reranked %d candidates -> selected top-%d chunks:",
+                "Neural reranking completed | model=%s candidates=%d selected=%d latency_ms=%.1f",
+                self.model,
                 len(pool),
                 len(final_selected),
+                latency_ms,
+                extra={"phase": LogPhase.RERANKING},
             )
-            for rank, c in enumerate(final_selected, 1):
-                clean_snippet = c.content[:85].replace("\n", " ").strip()
-                logger.info(
-                    "   ├─ Rank #%d: [chunk: %s | channel: %s] Groq Score: %.1f/10.0 (Norm: %.4f | RRF: %.6f) Reason: '%s' | \"%s...\"",
-                    rank,
-                    c.chunk_id,
-                    getattr(c, "retrieval_channel", "dense"),
-                    getattr(c, "reranker_score", 0.0),
-                    c.score,
-                    getattr(c, "rrf_score", 0.0),
-                    getattr(c, "reranker_reason", ""),
-                    clean_snippet,
-                )
-
             return final_selected
 
         except Exception as exc:
             logger.warning(
-                "[STAGE 2B: GROQ RERANKER FALLBACK] Groq LLM reranking encountered an exception (%s: %s). "
-                "Gracefully falling back to RRF fusion ranks.",
+                "Neural reranking failed, falling back to RRF | model=%s error=%s",
+                self.model,
                 type(exc).__name__,
-                exc,
+                extra={"phase": LogPhase.RERANKING},
             )
             return pool[:top_n]
 

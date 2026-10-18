@@ -1,36 +1,56 @@
-"""Consolidated API router exposing Health, Document, and Q&A endpoints."""
-
+import asyncio
+import json
+from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
+from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.dependencies import (
+    get_chunker,
     get_document_service,
     get_embedding_provider,
     get_llm_provider,
     get_rag_service,
+    get_storage_service,
     get_vector_store,
 )
 from app.core.config import Settings, get_settings
 from app.core.rate_limiter import get_client_ip, rate_limit_ask
-from app.db.database import get_db
+from app.db.database import AsyncSessionLocal, get_db, get_session_factory
 from app.db.models import Chunk, Document
+from app.db.repositories import ChunkRepository, DocumentRepository
+from app.ingestion.validator import FileValidationService
 from app.providers.embeddings import BaseEmbeddingProvider
 from app.providers.llm import BaseLLMProvider
 from app.providers.vector_store import BaseVectorStore
 from app.schemas.common import HealthResponse
 from app.schemas.document import (
+    AsyncIngestionJobResponse,
     DocumentCreate,
     DocumentListItem,
     DocumentListResponse,
     DocumentResponse,
+    JobStatusResponse,
     MultiFileUploadResponse,
 )
 from app.schemas.rag import AskRequest, AskResponse
 from app.services.chat_service import RAGService
 from app.services.document_service import DocumentService
+from app.services.job_manager import global_job_manager
 
 api_router = APIRouter()
 
@@ -109,13 +129,14 @@ async def create_document(
 
 @api_router.post(
     "/documents/upload",
-    response_model=MultiFileUploadResponse,
+    response_model=MultiFileUploadResponse | AsyncIngestionJobResponse,
     status_code=status.HTTP_201_CREATED,
     tags=["Documents"],
-    summary="Upload multiple files (up to 5)",
+    summary="Upload multiple files (up to 5) with synchronous or asynchronous processing",
 )
 async def upload_multiple_documents(
     request: Request,
+    response: Response,
     files: list[UploadFile] = File(
         ..., description="List of files to upload (max 5 files, 5MB each)"
     ),
@@ -123,14 +144,153 @@ async def upload_multiple_documents(
         None, description="Optional existing session ID to append documents into"
     ),
     user_id: str | None = Form(None, description="Optional user identifier for document isolation"),
+    background: bool = Query(
+        default=False, description="Process files asynchronously in background job"
+    ),
     service: DocumentService = Depends(get_document_service),
-) -> MultiFileUploadResponse:
-    effective_user = user_id or getattr(request.state, "user_id", None)
-    sess_from_state = getattr(request.state, "session_id", None)
-    effective_session = session_id or (sess_from_state if sess_from_state != "default" else None)
-    return await service.ingest_uploaded_files(
-        files=files, session_id=effective_session, user_id=effective_user
+    session_factory: async_sessionmaker[AsyncSession] = Depends(get_session_factory),
+) -> MultiFileUploadResponse | AsyncIngestionJobResponse:
+    effective_user = (
+        user_id
+        or getattr(request.state, "user_id", None)
+        or service.storage_service.generate_user_id()
     )
+    sess_from_state = getattr(request.state, "session_id", None)
+    effective_session = session_id or (
+        sess_from_state
+        if sess_from_state and sess_from_state != "default"
+        else service.storage_service.generate_session_id()
+    )
+
+    if not background:
+        return await service.ingest_uploaded_files(
+            files=files, session_id=effective_session, user_id=effective_user
+        )
+
+    # 1. Quick File Validation (Quantity, formats, sizes)
+    FileValidationService.validate_uploaded_files(files)
+
+    # 2. Fast disk persistence before closing HTTP request socket
+    saved_files: list[tuple[Path, str, int]] = []
+    for file in files:
+        saved_path, file_size = await service.storage_service.save_uploaded_file(
+            file, effective_session, user_id=effective_user
+        )
+        saved_files.append((saved_path, file.filename or "", file_size))
+
+    # 3. Register pending job with TTL manager
+    job = global_job_manager.create_job(
+        session_id=effective_session,
+        user_id=effective_user,
+        total_files=len(saved_files),
+        file_names=[f[1] for f in saved_files],
+    )
+
+    # 4. Spawn background worker with dedicated async DB session
+    async def _async_worker(
+        job_id: str,
+        files_to_process: list[tuple[Path, str, int]],
+        sess_id: str,
+        usr_id: str,
+    ):
+        async with session_factory() as db_session:
+            try:
+                doc_repo = DocumentRepository(db_session)
+                chunk_repo = ChunkRepository(db_session)
+                doc_service = DocumentService(
+                    document_repo=doc_repo,
+                    chunk_repo=chunk_repo,
+                    embedding_provider=service.embedding_provider,
+                    vector_store=service.vector_store,
+                    chunker=service.chunker,
+                    storage_service=service.storage_service,
+                )
+                await doc_service.ingest_pre_saved_files(
+                    job_id=job_id,
+                    saved_files=files_to_process,
+                    session_id=sess_id,
+                    user_id=usr_id,
+                )
+                await db_session.commit()
+            except Exception as exc:
+                await db_session.rollback()
+                await global_job_manager.fail_job(
+                    job_id, f"Background processing failed: {str(exc)}"
+                )
+
+    asyncio.create_task(_async_worker(job.job_id, saved_files, effective_session, effective_user))
+
+    response.status_code = status.HTTP_202_ACCEPTED
+    return AsyncIngestionJobResponse(
+        job_id=job.job_id,
+        session_id=effective_session,
+        user_id=effective_user,
+        status="queued",
+        total_files=len(saved_files),
+        message=f"Indexing job queued with {len(saved_files)} file(s).",
+        poll_url=f"/api/v1/documents/jobs/{job.job_id}",
+        stream_url=f"/api/v1/documents/jobs/{job.job_id}/events",
+    )
+
+
+@api_router.get(
+    "/documents/jobs/{job_id}/events",
+    tags=["Documents"],
+    summary="Stream real-time ingestion progress via Server-Sent Events (SSE)",
+)
+async def stream_job_events(job_id: str):
+    job = global_job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job '{job_id}' not found or expired.",
+        )
+
+    async def event_generator():
+        current_data = global_job_manager.get_job_dict(job_id)
+        if current_data:
+            yield f"data: {json.dumps(current_data)}\n\n"
+            if current_data.get("status") in ("completed", "failed", "completed_with_errors"):
+                return
+
+        queue = await global_job_manager.subscribe(job_id)
+        try:
+            while True:
+                try:
+                    payload = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    yield f"data: {json.dumps(payload)}\n\n"
+                    if payload.get("status") in ("completed", "failed", "completed_with_errors"):
+                        break
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"
+        finally:
+            await global_job_manager.unsubscribe(job_id, queue)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@api_router.get(
+    "/documents/jobs/{job_id}",
+    response_model=JobStatusResponse,
+    tags=["Documents"],
+    summary="Get ingestion job status snapshot",
+)
+async def get_job_status(job_id: str) -> JobStatusResponse:
+    job_dict = global_job_manager.get_job_dict(job_id)
+    if not job_dict:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job '{job_id}' not found or expired.",
+        )
+    return JobStatusResponse(**job_dict)
 
 
 @api_router.get(
@@ -190,6 +350,7 @@ async def get_document(
         document_id=doc.id,
         status=doc.status,
         title=doc.title,
+        content=doc.content,
         chunk_count=doc.chunk_count,
         session_id=doc.session_id,
         user_id=doc.user_id,
