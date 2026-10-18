@@ -7,6 +7,7 @@ from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
+from app.core.logging import LogPhase
 from app.db.database import get_db
 from app.db.repositories import (
     ChunkRepository,
@@ -74,89 +75,138 @@ def get_chunker() -> TextChunker:
     return _chunker_instance
 
 
-def get_embedding_provider(
-    settings: Annotated[Settings, Depends(get_settings)],
-) -> BaseEmbeddingProvider:
-    """Factory returning the configured embedding provider with mock fallback."""
-    provider_type = settings.EMBEDDING_PROVIDER.lower()
+_embedding_cache: dict[tuple, BaseEmbeddingProvider] = {}
+_llm_cache: dict[tuple, BaseLLMProvider] = {}
+_reranker_cache: dict[tuple, BaseReranker] = {}
 
+
+def get_embedding_provider(
+    settings: Annotated[Settings, Depends(get_settings)] = None,
+) -> BaseEmbeddingProvider:
+    """Factory returning the configured embedding provider with mock fallback and client reuse."""
+    curr_settings = settings or get_settings()
+    provider_type = curr_settings.EMBEDDING_PROVIDER.lower()
+    cache_key = (provider_type, curr_settings.GEMINI_API_KEY, curr_settings.GEMINI_EMBEDDING_MODEL)
+    if cache_key in _embedding_cache:
+        return _embedding_cache[cache_key]
+
+    provider: BaseEmbeddingProvider
     if provider_type == "gemini" and settings.GEMINI_API_KEY:
         try:
-            return GeminiEmbeddingProvider(
+            provider = GeminiEmbeddingProvider(
                 api_key=settings.GEMINI_API_KEY,
                 model=settings.GEMINI_EMBEDDING_MODEL,
             )
+            _embedding_cache[cache_key] = provider
+            return provider
         except Exception as exc:
             logger.warning(
-                "Failed to initialize Gemini embedding provider (%s). Falling back to mock.",
-                exc,
+                "Embedding provider initialization failed, falling back to mock | provider=gemini error=%s",
+                type(exc).__name__,
+                extra={"phase": LogPhase.PROVIDER},
             )
 
-    return MockEmbeddingProvider(dimension=384)
+    provider = MockEmbeddingProvider(dimension=384)
+    _embedding_cache[cache_key] = provider
+    return provider
 
 
 def get_llm_provider(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> BaseLLMProvider:
-    """Factory returning the configured LLM provider with LangSmith tracing and mock fallback."""
+    """Factory returning the configured LLM provider with LangSmith tracing, mock fallback, and client reuse."""
     provider_type = settings.LLM_PROVIDER.lower()
+    cache_key = (
+        provider_type,
+        settings.GEMINI_API_KEY,
+        settings.GEMINI_MODEL,
+        settings.GROQ_API_KEY,
+        settings.GROQ_MODEL,
+        settings.OPENAI_API_KEY,
+    )
+    if cache_key in _llm_cache:
+        return _llm_cache[cache_key]
 
+    provider: BaseLLMProvider
     if provider_type == "gemini" and settings.GEMINI_API_KEY:
         try:
-            return LangChainLLMProvider(
+            provider = LangChainLLMProvider(
                 provider="gemini",
                 api_key=settings.GEMINI_API_KEY,
                 model=settings.GEMINI_MODEL,
             )
+            _llm_cache[cache_key] = provider
+            return provider
         except Exception as exc:
             logger.warning(
-                "Failed to initialize LangChain Gemini provider (%s). Falling back to direct provider.",
-                exc,
+                "LLM provider initialization fallback to direct | provider=gemini error=%s",
+                type(exc).__name__,
+                extra={"phase": LogPhase.PROVIDER},
             )
             try:
-                return GeminiLLMProvider(
+                provider = GeminiLLMProvider(
                     api_key=settings.GEMINI_API_KEY,
                     model=settings.GEMINI_MODEL,
                 )
+                _llm_cache[cache_key] = provider
+                return provider
             except Exception as e:
-                logger.warning("Gemini LLM initialization failed (%s). Falling back to mock.", e)
+                logger.warning(
+                    "LLM provider initialization fallback to mock | provider=gemini error=%s",
+                    type(e).__name__,
+                    extra={"phase": LogPhase.PROVIDER},
+                )
 
     if provider_type == "groq" and settings.GROQ_API_KEY:
         try:
-            return LangChainLLMProvider(
+            provider = LangChainLLMProvider(
                 provider="groq",
                 api_key=settings.GROQ_API_KEY,
                 model=settings.GROQ_MODEL,
             )
+            _llm_cache[cache_key] = provider
+            return provider
         except Exception as exc:
             logger.warning(
-                "Failed to initialize LangChain Groq provider (%s). Falling back to direct provider.",
-                exc,
+                "LLM provider initialization fallback to direct | provider=groq error=%s",
+                type(exc).__name__,
+                extra={"phase": LogPhase.PROVIDER},
             )
             try:
-                return GroqLLMProvider(
+                provider = GroqLLMProvider(
                     api_key=settings.GROQ_API_KEY,
                     model=settings.GROQ_MODEL,
                     base_url=settings.GROQ_BASE_URL,
                 )
+                _llm_cache[cache_key] = provider
+                return provider
             except Exception as e:
-                logger.warning("Groq LLM initialization failed (%s). Falling back to mock.", e)
+                logger.warning(
+                    "LLM provider initialization fallback to mock | provider=groq error=%s",
+                    type(e).__name__,
+                    extra={"phase": LogPhase.PROVIDER},
+                )
 
     if provider_type in ("openai", "openrouter") and settings.OPENAI_API_KEY:
         try:
-            return LangChainLLMProvider(
+            provider = LangChainLLMProvider(
                 provider="openai",
                 api_key=settings.OPENAI_API_KEY,
                 model="gpt-4o-mini",
                 base_url=settings.OPENAI_BASE_URL,
             )
+            _llm_cache[cache_key] = provider
+            return provider
         except Exception as exc:
             logger.warning(
-                "Failed to initialize LangChain OpenAI provider (%s). Falling back to mock.",
-                exc,
+                "LLM provider initialization fallback to mock | provider=openai error=%s",
+                type(exc).__name__,
+                extra={"phase": LogPhase.PROVIDER},
             )
 
-    return MockLLMProvider()
+    provider = MockLLMProvider()
+    _llm_cache[cache_key] = provider
+    return provider
 
 
 # Repository Dependencies
@@ -190,16 +240,30 @@ def get_reranker(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> BaseReranker:
     reranker_type = settings.RERANKER_TYPE.lower()
+    cache_key = (
+        reranker_type,
+        settings.GROQ_API_KEY,
+        settings.GROQ_RERANKER_MODEL,
+        settings.RETRIEVAL_TOP_K,
+    )
+    if cache_key in _reranker_cache:
+        return _reranker_cache[cache_key]
+
+    reranker: BaseReranker
     if reranker_type == "groq" and settings.GROQ_API_KEY:
-        return GroqLLMReranker(
+        reranker = GroqLLMReranker(
             groq_api_key=settings.GROQ_API_KEY,
             model=settings.GROQ_RERANKER_MODEL,
             rrf_k=60,
             max_candidates=settings.RETRIEVAL_TOP_K,
         )
     elif reranker_type == "mock":
-        return MockReranker()
-    return ReciprocalRankReranker(rrf_k=60)
+        reranker = MockReranker()
+    else:
+        reranker = ReciprocalRankReranker(rrf_k=60)
+
+    _reranker_cache[cache_key] = reranker
+    return reranker
 
 
 def get_synthesizer(
@@ -297,8 +361,9 @@ async def hydrate_vector_store(session: AsyncSession) -> int:
     if indexed_chunks:
         await vector_store.add_chunks(indexed_chunks)
     logger.info(
-        "Hydrated vector store with %d chunk embeddings from database (dim: %d).",
+        "Vector store hydrated from database | chunks=%d dimension=%d",
         len(indexed_chunks),
         expected_dim,
+        extra={"phase": LogPhase.VECTOR_STORE},
     )
     return len(indexed_chunks)

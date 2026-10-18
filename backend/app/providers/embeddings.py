@@ -3,8 +3,10 @@
 Includes BaseEmbeddingProvider, GeminiEmbeddingProvider, and MockEmbeddingProvider.
 """
 
+import asyncio
 import hashlib
 import logging
+import random
 import re
 import sys
 from abc import ABC, abstractmethod
@@ -14,6 +16,7 @@ import numpy as np
 
 from app.core.config import get_settings
 from app.core.exceptions import UpstreamProviderError
+from app.core.logging import LogPhase, mask_sensitive_data
 
 logger = logging.getLogger(__name__)
 _settings = get_settings()
@@ -37,13 +40,13 @@ class BaseEmbeddingProvider(ABC):
 
 
 class GeminiEmbeddingProvider(BaseEmbeddingProvider):
-    """Generates embeddings using LangChain's GoogleGenerativeAIEmbeddings wrapper with LangSmith tracing."""
+    """Generates embeddings using Google Generative Language API with retry backoff and LangSmith tracing."""
 
     def __init__(
         self,
         api_key: str,
         model: str = "models/gemini-embedding-2",
-        timeout_seconds: float = 12.0,
+        timeout_seconds: float = 15.0,
     ):
         if not api_key:
             raise ValueError("Gemini API key is required for GeminiEmbeddingProvider.")
@@ -63,13 +66,15 @@ class GeminiEmbeddingProvider(BaseEmbeddingProvider):
             )
             self._use_langchain = True
             logger.info(
-                "Initialized GeminiEmbeddingProvider using LangChain GoogleGenerativeAIEmbeddings (%s).",
+                "Embedding provider initialized | provider=gemini model=%s engine=langchain",
                 self.model,
+                extra={"phase": LogPhase.PROVIDER},
             )
         except Exception as exc:
             logger.warning(
-                "Failed to initialize LangChain GoogleGenerativeAIEmbeddings (%s). Using direct REST.",
-                exc,
+                "Embedding provider initialization fallback | provider=gemini model=%s engine=direct_rest",
+                self.model,
+                extra={"phase": LogPhase.PROVIDER},
             )
 
     @property
@@ -77,30 +82,241 @@ class GeminiEmbeddingProvider(BaseEmbeddingProvider):
         return self._dim
 
     async def embed_text(self, text: str) -> list[float]:
-        """Embed a single text string using LangChain GoogleGenerativeAIEmbeddings."""
-        if self._use_langchain and self._embedder:
-            try:
-                return await self._embedder.aembed_query(text)
-            except Exception as exc:
-                logger.warning("LangChain embed_query failed (%s), falling back to REST.", exc)
+        """Embed a single text string with 2 retries and 5s exponential backoff."""
+        max_retries = 2
+        base_delay = 5.0
 
-        return await self._embed_text_http(text)
+        for attempt in range(max_retries + 1):
+            try:
+                if self._use_langchain and self._embedder:
+                    try:
+                        return await self._embedder.aembed_query(text)
+                    except Exception as lc_exc:
+                        lc_err_str = str(lc_exc).lower()
+                        is_quota = (
+                            "429" in lc_err_str
+                            or "resource_exhausted" in lc_err_str
+                            or "quota" in lc_err_str
+                        )
+                        if is_quota:
+                            if attempt < max_retries:
+                                delay = base_delay * (2**attempt) + random.uniform(0.1, 0.4)
+                                logger.warning(
+                                    "Provider rate limit encountered, backing off | provider=gemini engine=langchain attempt=%d max_retries=%d backoff_s=%.1f",
+                                    attempt + 1,
+                                    max_retries,
+                                    delay,
+                                    extra={"phase": LogPhase.PROVIDER},
+                                )
+                                await asyncio.sleep(delay)
+                                continue
+                            raise UpstreamProviderError(
+                                message="Gemini embedding API rate limit reached.",
+                                status_code=429,
+                                headers={"Retry-After": "30"},
+                            )
+                        logger.warning(
+                            "Provider invocation failed, falling back to direct REST | provider=gemini engine=langchain error=%s",
+                            type(lc_exc).__name__,
+                            extra={"phase": LogPhase.PROVIDER},
+                        )
+
+                return await self._embed_text_http(text)
+
+            except UpstreamProviderError as up_err:
+                if up_err.status_code in (429, 503) and attempt < max_retries:
+                    delay = base_delay * (2**attempt) + random.uniform(0.1, 0.4)
+                    logger.warning(
+                        "Provider rate limit encountered, backing off | provider=gemini engine=direct_rest attempt=%d max_retries=%d backoff_s=%.1f",
+                        attempt + 1,
+                        max_retries,
+                        delay,
+                        extra={"phase": LogPhase.PROVIDER},
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise
+            except httpx.TimeoutException:
+                if attempt < max_retries:
+                    delay = base_delay * (2**attempt) + random.uniform(0.1, 0.4)
+                    logger.warning(
+                        "Provider request timed out, retrying | provider=gemini engine=direct_rest attempt=%d max_retries=%d backoff_s=%.1f",
+                        attempt + 1,
+                        max_retries,
+                        delay,
+                        extra={"phase": LogPhase.PROVIDER},
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise UpstreamProviderError(
+                    "Timeout connecting to Gemini embedding service.", status_code=504
+                )
+            except Exception as exc:
+                if attempt < max_retries and (
+                    "429" in str(exc) or "quota" in str(exc).lower()
+                ):
+                    delay = base_delay * (2**attempt) + random.uniform(0.1, 0.4)
+                    logger.warning(
+                        "Provider rate limit encountered, backing off | provider=gemini attempt=%d max_retries=%d backoff_s=%.1f",
+                        attempt + 1,
+                        max_retries,
+                        delay,
+                        extra={"phase": LogPhase.PROVIDER},
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                logger.error(
+                    "Embedding generation failed | provider=gemini error=%s",
+                    type(exc).__name__,
+                    extra={"phase": LogPhase.PROVIDER},
+                )
+                raise UpstreamProviderError(
+                    f"Embedding generation failed: {mask_sensitive_data(str(exc))}"
+                )
+
+        raise UpstreamProviderError(
+            "Gemini embedding API rate limit reached after retries.", status_code=429
+        )
+
+    async def _embed_sub_batch_with_retry(
+        self, batch: list[str], max_retries: int = 2, base_delay: float = 5.0
+    ) -> list[list[float]]:
+        """Embed a sub-batch of texts with 2 retries and exponential backoff (starting at 5s)."""
+        for attempt in range(max_retries + 1):
+            try:
+                if self._use_langchain and self._embedder:
+                    try:
+                        return await self._embedder.aembed_documents(batch)
+                    except Exception as lc_exc:
+                        lc_err_str = str(lc_exc).lower()
+                        is_quota = (
+                            "429" in lc_err_str
+                            or "resource_exhausted" in lc_err_str
+                            or "quota" in lc_err_str
+                        )
+                        if is_quota:
+                            if attempt < max_retries:
+                                delay = base_delay * (2**attempt) + random.uniform(0.1, 0.4)
+                                logger.warning(
+                                    "Provider rate limit encountered, backing off | provider=gemini engine=langchain batch_size=%d attempt=%d max_retries=%d backoff_s=%.1f",
+                                    len(batch),
+                                    attempt + 1,
+                                    max_retries,
+                                    delay,
+                                    extra={"phase": LogPhase.PROVIDER},
+                                )
+                                await asyncio.sleep(delay)
+                                continue
+                            raise UpstreamProviderError(
+                                message="Gemini batch embedding rate limit reached.",
+                                status_code=429,
+                                headers={"Retry-After": "30"},
+                            )
+                        logger.warning(
+                            "Provider batch invocation failed, falling back to direct REST | provider=gemini engine=langchain error=%s",
+                            type(lc_exc).__name__,
+                            extra={"phase": LogPhase.PROVIDER},
+                        )
+
+                # Direct REST fallback using header authentication (zero keys in URL)
+                return await self._embed_batch_http(batch)
+
+            except UpstreamProviderError as up_err:
+                if up_err.status_code in (429, 503) and attempt < max_retries:
+                    delay = base_delay * (2**attempt) + random.uniform(0.1, 0.4)
+                    logger.warning(
+                        "Provider rate limit encountered, backing off | provider=gemini engine=direct_rest batch_size=%d attempt=%d max_retries=%d backoff_s=%.1f",
+                        len(batch),
+                        attempt + 1,
+                        max_retries,
+                        delay,
+                        extra={"phase": LogPhase.PROVIDER},
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise
+            except httpx.TimeoutException:
+                if attempt < max_retries:
+                    delay = base_delay * (2**attempt) + random.uniform(0.1, 0.4)
+                    logger.warning(
+                        "Provider request timed out, retrying | provider=gemini engine=direct_rest batch_size=%d attempt=%d max_retries=%d backoff_s=%.1f",
+                        len(batch),
+                        attempt + 1,
+                        max_retries,
+                        delay,
+                        extra={"phase": LogPhase.PROVIDER},
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise UpstreamProviderError(
+                    "Timeout connecting to Gemini embedding service.", status_code=504
+                )
+            except Exception as exc:
+                if attempt < max_retries and (
+                    "429" in str(exc) or "quota" in str(exc).lower()
+                ):
+                    delay = base_delay * (2**attempt) + random.uniform(0.1, 0.4)
+                    logger.warning(
+                        "Provider rate limit encountered, backing off | provider=gemini batch_size=%d attempt=%d max_retries=%d backoff_s=%.1f",
+                        len(batch),
+                        attempt + 1,
+                        max_retries,
+                        delay,
+                        extra={"phase": LogPhase.PROVIDER},
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                logger.error(
+                    "Batch embedding generation failed | provider=gemini error=%s",
+                    type(exc).__name__,
+                    extra={"phase": LogPhase.PROVIDER},
+                )
+                raise UpstreamProviderError(
+                    f"Embedding generation failed: {mask_sensitive_data(str(exc))}"
+                )
+
+        raise UpstreamProviderError(
+            "Gemini batch embedding rate limit reached after retries.", status_code=429
+        )
 
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
-        """Embed a batch of text strings using LangChain GoogleGenerativeAIEmbeddings."""
+        """Embed a batch of text strings, partitioned into sub-batches with polite rate-limit pacing."""
         if not texts:
             return []
-        if self._use_langchain and self._embedder:
-            try:
-                return await self._embedder.aembed_documents(texts)
-            except Exception as exc:
-                logger.warning("LangChain embed_documents failed (%s), falling back to REST.", exc)
 
-        return await self._embed_batch_http(texts)
+        # Google Gemini batchEmbedContents works best with <= 20 texts per request to respect RPM & TPM limits
+        sub_batch_size = 20
+        all_embeddings: list[list[float]] = []
+        total_sub_batches = (len(texts) + sub_batch_size - 1) // sub_batch_size
+
+        for idx in range(0, len(texts), sub_batch_size):
+            batch = texts[idx : idx + sub_batch_size]
+            sub_batch_num = (idx // sub_batch_size) + 1
+            if total_sub_batches > 1:
+                logger.info(
+                    "Batch embedding sub-batch dispatched | provider=gemini sub_batch=%d/%d chunks=%d",
+                    sub_batch_num,
+                    total_sub_batches,
+                    len(batch),
+                    extra={"phase": LogPhase.EMBEDDING},
+                )
+
+            batch_embeddings = await self._embed_sub_batch_with_retry(batch)
+            all_embeddings.extend(batch_embeddings)
+
+            # Pacing sleep between consecutive sub-batches to respect rate limits
+            if idx + sub_batch_size < len(texts):
+                await asyncio.sleep(0.35)
+
+        return all_embeddings
 
     async def _embed_text_http(self, text: str) -> list[float]:
-        """Embed a single text string via REST fallback."""
-        url = f"https://generativelanguage.googleapis.com/v1beta/{self.model}:embedContent?key={self.api_key}"
+        """Embed a single text string via REST fallback using header authentication (no keys in URL)."""
+        url = f"https://generativelanguage.googleapis.com/v1beta/{self.model}:embedContent"
+        headers = {
+            "x-goog-api-key": self.api_key,
+            "Content-Type": "application/json",
+        }
         payload = {
             "model": self.model,
             "content": {"parts": [{"text": text}]},
@@ -108,11 +324,11 @@ class GeminiEmbeddingProvider(BaseEmbeddingProvider):
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             try:
-                response = await client.post(url, json=payload)
+                response = await client.post(url, headers=headers, json=payload)
                 if response.status_code == 429:
                     raise UpstreamProviderError(
                         message="Gemini embedding API rate limit reached.",
-                        status_code=503,
+                        status_code=429,
                         headers={"Retry-After": "30"},
                     )
                 response.raise_for_status()
@@ -121,64 +337,54 @@ class GeminiEmbeddingProvider(BaseEmbeddingProvider):
                 if not embedding:
                     raise UpstreamProviderError("Gemini returned empty embedding values.")
                 return embedding
-            except httpx.TimeoutException as exc:
-                logger.error("Gemini embedding request timed out: %s", exc)
-                raise UpstreamProviderError(
-                    "Timeout connecting to Gemini embedding service.", status_code=504
-                )
+            except httpx.TimeoutException:
+                raise
             except httpx.HTTPStatusError as exc:
                 logger.error(
-                    "Gemini embedding HTTP error %s: %s",
+                    "Embedding HTTP request failed | provider=gemini status=%d",
                     exc.response.status_code,
-                    exc.response.text,
+                    extra={"phase": LogPhase.PROVIDER},
                 )
                 raise UpstreamProviderError(
                     f"Gemini embedding API returned status {exc.response.status_code}.",
                     status_code=502,
                 )
-            except Exception as exc:
-                logger.error("Unexpected error in Gemini embedding: %s", exc)
-                raise UpstreamProviderError(f"Embedding generation failed: {exc!s}")
 
     async def _embed_batch_http(self, texts: list[str]) -> list[list[float]]:
-        """Embed a batch of text strings using batchEmbedContents REST fallback."""
-        url = f"https://generativelanguage.googleapis.com/v1beta/{self.model}:batchEmbedContents?key={self.api_key}"
+        """Embed a sub-batch of text strings using batchEmbedContents REST fallback with header auth."""
+        url = f"https://generativelanguage.googleapis.com/v1beta/{self.model}:batchEmbedContents"
+        headers = {
+            "x-goog-api-key": self.api_key,
+            "Content-Type": "application/json",
+        }
         requests_payload = [
-            {"model": self.model, "content": {"parts": [{"text": text}]}} for text in texts[:100]
+            {"model": self.model, "content": {"parts": [{"text": text}]}}
+            for text in texts
         ]
 
         async with httpx.AsyncClient(timeout=self.timeout * 2) as client:
-            try:
-                response = await client.post(url, json={"requests": requests_payload})
-                if response.status_code == 429:
-                    raise UpstreamProviderError(
-                        message="Gemini batch embedding rate limit reached.",
-                        status_code=503,
-                        headers={"Retry-After": "30"},
-                    )
-                response.raise_for_status()
-                data = response.json()
-                embeddings = [item.get("values", []) for item in data.get("embeddings", [])]
-                if len(texts) > 100:
-                    remainder = await self._embed_batch_http(texts[100:])
-                    embeddings.extend(remainder)
-                return embeddings
-            except (
-                httpx.TimeoutException,
-                httpx.HTTPStatusError,
-                UpstreamProviderError,
-            ):
-                raise
-            except Exception as exc:
-                logger.warning(
-                    "Batch embedding failed (%s), falling back to sequential calls.",
-                    exc,
+            response = await client.post(
+                url, headers=headers, json={"requests": requests_payload}
+            )
+            if response.status_code == 429:
+                raise UpstreamProviderError(
+                    message="Gemini batch embedding rate limit reached.",
+                    status_code=429,
+                    headers={"Retry-After": "30"},
                 )
-                results = []
-                for t in texts:
-                    res = await self._embed_text_http(t)
-                    results.append(res)
-                return results
+            if response.status_code != 200:
+                logger.error(
+                    "Batch embedding HTTP request failed | provider=gemini status=%d",
+                    response.status_code,
+                    extra={"phase": LogPhase.PROVIDER},
+                )
+                raise UpstreamProviderError(
+                    f"Gemini embedding API returned status {response.status_code}.",
+                    status_code=502,
+                )
+            data = response.json()
+            embeddings = [item.get("values", []) for item in data.get("embeddings", [])]
+            return embeddings
 
 
 class MockEmbeddingProvider(BaseEmbeddingProvider):

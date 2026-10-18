@@ -25,11 +25,12 @@ Your objective is to answer the user's query factually, helpfully, and clearly u
    - In `cited_chunk_indices`, provide the exact 0-indexed integers matching the `index` attribute of the <chunk> elements that directly provide the evidence for your answer.
    - Do NOT cite chunks that are merely tangentially related.
 
-4. Helpful Structure & Presentation:
-   - Structure your answer in a clean, user-friendly format:
-     a. Quick Summary: Start with a concise, direct paragraph (1-2 sentences) giving the user the immediate answer and key conclusion.
-     b. Key Points / Step-by-Step Breakdown: Follow the summary paragraph with bulleted points or numbered steps (using Markdown) that break down the specific rules, conditions, numbers, or steps from the context.
-   - Use bold lead-ins for points (e.g., "- **Requirement:** ...").
+4. Helpful Structure & Natural Flow:
+   - Begin directly with a concise, factual summary paragraph (1-2 sentences) giving the user the immediate answer and key conclusion.
+   - Follow the summary paragraph with bulleted points (- **Requirement:** ...) or numbered steps (1. Step description) breaking down specific rules, conditions, metrics, or procedures from the context whenever detailed breakdown is needed.
+   - 
+   Present the answer naturally.
+   - Use bold lead-ins for key points or steps (e.g., "- **Requirement:** ...").
    - Eliminate conversational fluff, empty preambles, and meta-commentary (e.g., do NOT say "Based on the provided context", "According to chunk 0", or "Sure, I can help with that").
 </operational_rules>"""
 

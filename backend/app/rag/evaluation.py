@@ -34,6 +34,7 @@ from deepeval.models import DeepEvalBaseLLM
 from deepeval.test_case import LLMTestCase
 
 from app.core.config import get_settings
+from app.core.logging import LogPhase
 
 logger = logging.getLogger(__name__)
 
@@ -88,10 +89,11 @@ class GroqDeepEvalModel(DeepEvalBaseLLM):
                     and attempt < max_retries - 1
                 ):
                     logger.warning(
-                        "Groq rate limit encountered during evaluation (attempt %d/%d). Sleeping %.1fs...",
+                        "Provider rate limit encountered during evaluation | provider=groq attempt=%d max_retries=%d backoff_s=%.1f",
                         attempt + 1,
                         max_retries,
                         delay,
+                        extra={"phase": LogPhase.BACKGROUND},
                     )
                     time.sleep(delay)
                     delay *= 2
@@ -130,10 +132,11 @@ class GroqDeepEvalModel(DeepEvalBaseLLM):
                     and attempt < max_retries - 1
                 ):
                     logger.warning(
-                        "Groq rate limit encountered during evaluation (attempt %d/%d). Sleeping %.1fs...",
+                        "Provider rate limit encountered during evaluation | provider=groq attempt=%d max_retries=%d backoff_s=%.1f",
                         attempt + 1,
                         max_retries,
                         delay,
+                        extra={"phase": LogPhase.BACKGROUND},
                     )
                     await asyncio.sleep(delay)
                     delay *= 2
@@ -339,10 +342,13 @@ async def setup_benchmark_pipeline(
         reranker = ReciprocalRankReranker(rrf_k=60)
     else:
         target_model = model_name or settings.DEEPEVAL_MODEL
-        embedding_provider = GeminiEmbeddingProvider(
-            api_key=settings.GEMINI_API_KEY,
-            model=settings.GEMINI_EMBEDDING_MODEL,
-        )
+        if settings.GEMINI_API_KEY:
+            embedding_provider = GeminiEmbeddingProvider(
+                api_key=settings.GEMINI_API_KEY,
+                model=settings.GEMINI_EMBEDDING_MODEL,
+            )
+        else:
+            embedding_provider = MockEmbeddingProvider()
         llm_provider = LangChainLLMProvider(
             provider="groq",
             api_key=settings.GROQ_API_KEY,
@@ -486,7 +492,12 @@ class RAGPipelineEvaluator:
                     )
                 )
             except Exception as exc:
-                logger.warning("Metric %s failed evaluation: %s", metric.__class__.__name__, exc)
+                logger.warning(
+                    "Evaluation metric execution failed | metric=%s error=%s",
+                    metric.__class__.__name__,
+                    type(exc).__name__,
+                    extra={"phase": LogPhase.BACKGROUND},
+                )
                 scores.append(
                     MetricScore(
                         name=metric.__class__.__name__,
@@ -523,7 +534,12 @@ class RAGPipelineEvaluator:
             if idx > 1:
                 # Inter-case pacing to respect Groq TPM rate limits during live benchmarks
                 await asyncio.sleep(2.0)
-            logger.info("Evaluating Golden [%d/%d]: '%s'...", idx, len(goldens), g.input[:60])
+            logger.info(
+                "Evaluation sample execution started | index=%d total=%d",
+                idx,
+                len(goldens),
+                extra={"phase": LogPhase.BACKGROUND},
+            )
             res = await self.evaluate_test_case(
                 golden=g,
                 session_id=session_id,

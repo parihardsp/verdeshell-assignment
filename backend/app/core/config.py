@@ -145,7 +145,7 @@ class Settings(BaseSettings):
         default=5 * 1024 * 1024, description="Maximum upload size (5MB)"
     )
     ALLOWED_EXTENSIONS: list[str] = Field(
-        default=[".txt", ".md", ".pdf", ".docx"],
+        default=[".txt", ".md", ".pdf", ".docx", ".doc"],
         description="Permitted file extensions for document upload",
     )
 

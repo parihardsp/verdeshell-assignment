@@ -60,7 +60,7 @@ class SourceCitation(BaseModel):
 
 
 class AskResponse(BaseModel):
-    """Schema for POST /ask response matching assignment specification."""
+    """Schema for POST /ask response containing synthesized answer, citations, and telemetry."""
 
     model_config = ConfigDict(from_attributes=True)
 

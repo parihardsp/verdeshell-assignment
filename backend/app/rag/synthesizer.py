@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from langsmith import traceable
 
+from app.core.logging import LogPhase
 from app.providers.llm import BaseLLMProvider
 from app.rag.prompts.synthesis_prompts import (
     INSUFFICIENT_CONTEXT_MESSAGE,
@@ -70,8 +71,9 @@ class GroundedSynthesizer(BaseSynthesizer):
             scope_desc = f" for session '{session_id}'" if session_id else ""
             elapsed_ms = int((time.perf_counter() - start_time) * 1000)
             logger.info(
-                "[STAGE 3: GROUNDED SYNTHESIS] Zero context chunks available%s. Returning grounded fallback answer.",
-                scope_desc,
+                "Grounded synthesis skipped | reason=zero_context_chunks latency_ms=%d",
+                elapsed_ms,
+                extra={"phase": LogPhase.GENERATION},
             )
             return SynthesizedAnswer(
                 answer=f"The provided knowledge base{scope_desc} does not contain information to answer this question.",
@@ -88,13 +90,6 @@ class GroundedSynthesizer(BaseSynthesizer):
         )
 
         provider_name = self.llm_provider.__class__.__name__
-        logger.info(
-            "[STAGE 3: GROUNDED SYNTHESIS] Structured generation with %d context chunk(s) (%d chars) via %s...",
-            len(context_chunks),
-            len(context_str),
-            provider_name,
-        )
-
         structured_output: GroundedSynthesisOutput | None = None
 
         try:
@@ -103,19 +98,22 @@ class GroundedSynthesizer(BaseSynthesizer):
                 system_prompt=SYNTHESIS_SYSTEM_PROMPT,
                 user_prompt=user_prompt,
             )
+            elapsed_ms = int((time.perf_counter() - start_time) * 1000)
             logger.info(
-                "[SYNTHESIS: STRUCTURED RESULT] %s generated answer (sufficient=%s, cited=%s, confidence=%.2f).",
+                "Grounded synthesis completed | provider=%s sufficient=%s citations=%d confidence=%.2f latency_ms=%d",
                 provider_name,
                 structured_output.has_sufficient_context,
-                structured_output.cited_chunk_indices,
+                len(structured_output.cited_chunk_indices),
                 structured_output.confidence_score,
+                elapsed_ms,
+                extra={"phase": LogPhase.GENERATION},
             )
         except Exception as exc:
             logger.warning(
-                "Structured generation with %s failed (%s: %s). Falling back to raw response generation...",
+                "Structured synthesis failed, falling back to raw | provider=%s error=%s",
                 provider_name,
                 type(exc).__name__,
-                exc,
+                extra={"phase": LogPhase.GENERATION},
             )
             try:
                 raw_answer = await self.llm_provider.generate_response(
@@ -129,7 +127,11 @@ class GroundedSynthesizer(BaseSynthesizer):
                     confidence_score=0.8,
                 )
             except Exception as inner_exc:
-                logger.error("Upstream LLM completely unavailable: %s", inner_exc)
+                logger.error(
+                    "LLM synthesis provider failed, falling back to mock | error=%s",
+                    type(inner_exc).__name__,
+                    extra={"phase": LogPhase.GENERATION},
+                )
                 from app.providers.llm import MockLLMProvider
 
                 fallback_llm = MockLLMProvider()
@@ -143,7 +145,9 @@ class GroundedSynthesizer(BaseSynthesizer):
         if not structured_output.has_sufficient_context:
             elapsed_ms = int((time.perf_counter() - start_time) * 1000)
             logger.info(
-                "[SYNTHESIS: INSUFFICIENT CONTEXT] Grounded model flagged insufficient context. Returning clean refusal."
+                "Grounded synthesis insufficient context | provider=%s status=refusal",
+                provider_name,
+                extra={"phase": LogPhase.GENERATION},
             )
             return SynthesizedAnswer(
                 answer=structured_output.answer or INSUFFICIENT_CONTEXT_MESSAGE,
@@ -198,11 +202,6 @@ class GroundedSynthesizer(BaseSynthesizer):
             )
 
         elapsed_ms = int((time.perf_counter() - start_time) * 1000)
-        logger.info(
-            "[SYNTHESIS: COMPLETE] Answer synthesized in %d ms with %d grounded source citation(s).",
-            elapsed_ms,
-            len(sources),
-        )
         return SynthesizedAnswer(
             answer=structured_output.answer,
             sources=sources,

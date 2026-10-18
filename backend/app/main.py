@@ -5,6 +5,8 @@ handlers, and dual-mounted API routing (root and /api/v1).
 """
 
 import logging
+import time
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -18,12 +20,13 @@ from app.core.exceptions import (
     app_exception_handler,
     unhandled_exception_handler,
 )
-from app.core.logging import setup_logging
+from app.core.logging import LogPhase, set_phase_context, set_request_context, setup_logging
 from app.db import AsyncSessionLocal, engine, init_db
 
 # Initialize centralized context-aware logging
 setup_logging()
 logger = logging.getLogger("app")
+access_logger = logging.getLogger("app.access")
 
 settings = get_settings()
 
@@ -31,26 +34,38 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifecycle: initialize database tables and hydrate vector index."""
-    logger.info("Initializing Mini Knowledge Assistant backend...")
+    setup_logging()
+    logger.info(
+        "Service startup initiated | app=%s version=%s",
+        settings.APP_NAME,
+        settings.APP_VERSION,
+        extra={"phase": LogPhase.STARTUP},
+    )
     # 1. Create SQLite tables
     await init_db()
+    logger.info("Database schema initialized | status=ready", extra={"phase": LogPhase.DATABASE})
 
     # 2. Pre-populate in-memory vector store from SQLite
     async with AsyncSessionLocal() as session:
         hydrated_count = await hydrate_vector_store(session)
-        logger.info("Vector index ready with %d chunks.", hydrated_count)
+        logger.info(
+            "Vector store index ready | chunks=%d",
+            hydrated_count,
+            extra={"phase": LogPhase.STARTUP},
+        )
 
     if settings.LANGCHAIN_TRACING_V2 and settings.LANGCHAIN_API_KEY:
         logger.info(
-            "LangSmith Tracing active: project='%s' | endpoint='%s'",
+            "Distributed tracing active | project=%s endpoint=%s",
             settings.LANGCHAIN_PROJECT,
             settings.LANGCHAIN_ENDPOINT,
+            extra={"phase": LogPhase.STARTUP},
         )
 
     yield
 
     # Teardown
-    logger.info("Shutting down database engine...")
+    logger.info("Service shutdown initiated | engine=sqlite", extra={"phase": LogPhase.SHUTDOWN})
     await engine.dispose()
 
 
@@ -70,18 +85,21 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["Retry-After", "X-User-ID", "X-Session-ID"],
+    expose_headers=["Retry-After", "X-Request-ID", "X-User-ID", "X-Session-ID"],
 )
 
 
 @app.middleware("http")
 async def user_session_context_middleware(request: Request, call_next):
-    """Propagate user and session identifiers into contextvars, request.state, cookies, and response headers."""
-    from app.core.logging import (
-        set_request_context,
+    """Propagate request_id, user, and session identifiers into contextvars, request.state, cookies, and response headers."""
+    # 1. Request ID (honor incoming X-Request-ID or generate new req_xxxx)
+    request_id = (
+        request.headers.get("x-request-id")
+        or request.headers.get("request-id")
+        or f"req_{uuid.uuid4().hex[:8]}"
     )
 
-    # 1. Extract User ID from headers, cookies, or query params
+    # 2. Extract User ID from headers, cookies, or query params
     user_id = (
         request.headers.get("x-user-id")
         or request.headers.get("user-id")
@@ -90,7 +108,7 @@ async def user_session_context_middleware(request: Request, call_next):
         or "default_user"
     )
 
-    # 2. Extract Session ID from headers, cookies, or query params
+    # 3. Extract Session ID from headers, cookies, or query params
     session_id = (
         request.headers.get("x-session-id")
         or request.headers.get("session-id")
@@ -99,19 +117,50 @@ async def user_session_context_middleware(request: Request, call_next):
         or "default"
     )
 
-    # 3. Propagate into contextvars for centralized logging
+    # 4. Propagate into contextvars for centralized logging
     set_request_context(
         user_id=user_id,
         session_id=session_id,
+        request_id=request_id,
     )
+    set_phase_context(LogPhase.REQUEST)
 
-    # 4. Attach to request.state
+    # 5. Attach to request.state
+    request.state.request_id = request_id
     request.state.user_id = user_id
     request.state.session_id = session_id
 
-    response = await call_next(request)
+    start_time = time.perf_counter()
+    try:
+        response = await call_next(request)
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        client_ip = request.client.host if request.client else "127.0.0.1"
 
-    # 5. Echo context headers and set cookies for browser automatic identity persistence
+        access_logger.info(
+            "HTTP request completed | method=%s path=%s status=%d latency_ms=%.1f client_ip=%s",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration_ms,
+            client_ip,
+            extra={"phase": LogPhase.REQUEST},
+        )
+    except Exception as exc:
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        client_ip = request.client.host if request.client else "127.0.0.1"
+        access_logger.error(
+            "HTTP request failed | method=%s path=%s error=%s latency_ms=%.1f client_ip=%s",
+            request.method,
+            request.url.path,
+            type(exc).__name__,
+            duration_ms,
+            client_ip,
+            extra={"phase": LogPhase.REQUEST},
+        )
+        raise
+
+    # 6. Echo context headers and set cookies for browser automatic identity persistence
+    response.headers["X-Request-ID"] = request_id
     response.headers["X-User-ID"] = user_id
     if session_id != "default":
         response.headers["X-Session-ID"] = session_id

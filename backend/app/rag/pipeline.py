@@ -5,6 +5,7 @@ import time
 
 from langsmith import traceable
 
+from app.core.logging import LogPhase, set_request_context
 from app.db.models import QuestionHistory
 from app.db.repositories import QuestionHistoryRepository
 from app.rag.reranker import BaseReranker
@@ -45,18 +46,15 @@ class RAGPipeline:
         client_ip: str = "127.0.0.1",
     ) -> AskResponse:
         """Execute end-to-end RAG pipeline with stage-level observability and user isolation."""
-        from app.core.logging import set_request_context
-
         set_request_context(user_id=user_id, session_id=session_id)
 
         start_time = time.perf_counter()
-        logger.info("==================== [RAG PIPELINE EXECUTION START] ====================")
         logger.info(
-            "Question: '%s' | User: [%s] | Session: [%s] | Client IP: '%s'",
-            question,
-            user_id or "default_user",
-            session_id or "default",
+            "RAG pipeline started | top_k=%d top_n=%d client_ip=%s",
+            self.top_k,
+            self.top_n,
             client_ip,
+            extra={"phase": LogPhase.RETRIEVAL},
         )
 
         # Stage 1: Retrieval
@@ -84,9 +82,11 @@ class RAGPipeline:
 
         total_latency_ms = int((time.perf_counter() - start_time) * 1000)
         logger.info(
-            "==================== [RAG PIPELINE EXECUTION COMPLETED] (Latency: %d ms | Citations: %d) ====================",
-            total_latency_ms,
+            "RAG pipeline completed | citations=%d confidence=%.2f latency_ms=%d",
             len(synthesis_result.sources),
+            synthesis_result.confidence_score,
+            total_latency_ms,
+            extra={"phase": LogPhase.RESPONSE},
         )
 
         # Audit Logging
@@ -104,7 +104,11 @@ class RAGPipeline:
                 )
                 await self.query_repo.create(history)
             except Exception as exc:
-                logger.error("Failed to audit log question history: %s", exc)
+                logger.error(
+                    "Audit log creation failed | error=%s",
+                    type(exc).__name__,
+                    extra={"phase": LogPhase.DATABASE},
+                )
 
         return AskResponse(
             answer=synthesis_result.answer,

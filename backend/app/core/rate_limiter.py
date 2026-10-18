@@ -59,6 +59,16 @@ class SlidingWindowRateLimiter:
             # Record current valid request
             self._history[client_id].append(now)
 
+            # Prevent unbounded memory growth under high IP churn
+            if len(self._history) > 500:
+                stale_clients = [
+                    cid
+                    for cid, ts_list in self._history.items()
+                    if not ts_list or ts_list[-1] <= window_start
+                ]
+                for cid in stale_clients:
+                    del self._history[cid]
+
     def reset(self) -> None:
         """Clear all rate limit history (useful for tests)."""
         self._history.clear()
