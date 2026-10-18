@@ -143,3 +143,56 @@ async def test_session_isolation(async_client: AsyncClient):
     ask_a = await async_client.post("/api/v1/ask", json=q_a)
     assert ask_a.status_code == 200
     assert len(ask_a.json()["sources"]) > 0
+
+
+@pytest.mark.asyncio
+async def test_batch_upload_with_unextractable_file_graceful_handling(async_client: AsyncClient):
+    """Verify that an image-only/unextractable PDF does not abort the entire batch upload."""
+    # 1. Create a dummy PDF with zero text (simulating scanned/image-only PDF)
+    empty_doc = pymupdf.open()
+    empty_doc.new_page()  # Page without text
+    empty_pdf_bytes = empty_doc.tobytes()
+    empty_doc.close()
+
+    # 2. Batch with 1 valid file and 1 image-only PDF
+    files = [
+        (
+            "files",
+            (
+                "engineering_guide.txt",
+                io.BytesIO(b"Backend services use async SQLAlchemy with SQLite and FastAPI."),
+                "text/plain",
+            ),
+        ),
+        (
+            "files",
+            ("scanned_receipt.pdf", io.BytesIO(empty_pdf_bytes), "application/pdf"),
+        ),
+    ]
+
+    res = await async_client.post("/api/v1/documents/upload", files=files)
+    assert res.status_code == 201
+    data = res.json()
+
+    assert data["total_files"] == 2
+    assert data["indexed_count"] == 1
+    assert data["failed_count"] == 1
+
+    docs_by_name = {d["file_name"]: d for d in data["documents"]}
+    assert docs_by_name["engineering_guide.txt"]["status"] == "indexed"
+    assert docs_by_name["engineering_guide.txt"]["chunk_count"] >= 1
+
+    assert docs_by_name["scanned_receipt.pdf"]["status"] == "failed"
+    assert "no readable text" in docs_by_name["scanned_receipt.pdf"]["error_message"].lower()
+
+    # 3. Verify that the indexed document can be queried via RAG
+    ask_res = await async_client.post(
+        "/api/v1/ask",
+        json={
+            "question": "What backend framework and ORM are used?",
+            "session_id": data["session_id"],
+        },
+    )
+    assert ask_res.status_code == 200
+    assert len(ask_res.json()["sources"]) > 0
+
