@@ -16,7 +16,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel
 
 from app.core.exceptions import UpstreamProviderError
-from app.core.logging import LogPhase, mask_sensitive_data
+from app.core.logging import LogPhase
 
 logger = logging.getLogger(__name__)
 

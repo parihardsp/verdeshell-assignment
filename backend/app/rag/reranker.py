@@ -112,6 +112,7 @@ class ReciprocalRankReranker(BaseReranker):
 
         reranked = sorted(candidates, key=lambda c: rrf_scores[c.chunk_id], reverse=True)
 
+        # Theoretical maximum theoretical bound for reference: 2.0 / (self.rrf_k + 1)
         for c in reranked:
             c.score = rrf_scores[c.chunk_id]
             c.rrf_score = rrf_scores[c.chunk_id]

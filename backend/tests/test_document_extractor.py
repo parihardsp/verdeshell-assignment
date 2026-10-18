@@ -3,7 +3,6 @@
 Tests extraction of .docx, .doc, .md, .txt, .csv, and verifies binary safety guards.
 """
 
-import tempfile
 from pathlib import Path
 
 import docx

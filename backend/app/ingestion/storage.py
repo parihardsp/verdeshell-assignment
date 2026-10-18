@@ -46,15 +46,17 @@ class SessionFileStorageService:
     def get_session_directory(
         self, session_id: str, user_id: str | None = None
     ) -> tuple[Path, str]:
-        """Resolve and ensure the storage directory for a session/user and current date.
+        """Resolve and ensure the storage directory for a session and user.
+
+        Organizes uploads hierarchically under `data/uploads/{user_id}/{session_id}/`.
 
         Returns:
             Tuple of (Path to directory, date string YYYY-MM-DD)
         """
         date_str = datetime.now(UTC).strftime("%Y-%m-%d")
-        uid_part = f"{user_id}_" if user_id else ""
-        session_folder_name = f"{uid_part}{session_id}_{date_str}"
-        session_path = self.root_dir / session_folder_name
+        clean_user = re.sub(r"[^\w\-]", "_", user_id or "usr_default")
+        clean_sess = re.sub(r"[^\w\-]", "_", session_id or "sess_default")
+        session_path = self.root_dir / clean_user / clean_sess
         session_path.mkdir(parents=True, exist_ok=True)
         return session_path, date_str
 

@@ -70,7 +70,7 @@ class GeminiEmbeddingProvider(BaseEmbeddingProvider):
                 self.model,
                 extra={"phase": LogPhase.PROVIDER},
             )
-        except Exception as exc:
+        except Exception:
             logger.warning(
                 "Embedding provider initialization fallback | provider=gemini model=%s engine=direct_rest",
                 self.model,

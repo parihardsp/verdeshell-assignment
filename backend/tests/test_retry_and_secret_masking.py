@@ -9,12 +9,10 @@ import pytest
 
 from app.core.exceptions import UpstreamProviderError
 from app.core.logging import (
-    SecretMaskingFilter,
     SecretMaskingFormatter,
     mask_sensitive_data,
 )
 from app.providers.embeddings import GeminiEmbeddingProvider
-from app.providers.llm import GeminiLLMProvider
 
 
 def test_mask_sensitive_data_patterns():

@@ -96,7 +96,7 @@ async def user_session_context_middleware(request: Request, call_next):
     request_id = (
         request.headers.get("x-request-id")
         or request.headers.get("request-id")
-        or f"req_{uuid.uuid4().hex[:8]}"
+        or f"req_{uuid.uuid4().hex[:6]}"
     )
 
     # 2. Extract User ID from headers, cookies, or query params
@@ -191,9 +191,16 @@ async def root():
         "status": "operational",
         "documentation": "/docs",
         "endpoints": {
-            "add_document": "POST /api/v1/documents",
-            "list_documents": "GET /api/v1/documents",
-            "ask_question": "POST /api/v1/ask",
             "health_check": "GET /api/v1/health",
+            "upload_documents": "POST /api/v1/documents/upload (?background=true for async HTTP 202)",
+            "job_events_sse": "GET /api/v1/documents/jobs/{job_id}/events",
+            "job_status": "GET /api/v1/documents/jobs/{job_id}",
+            "create_document": "POST /api/v1/documents",
+            "list_documents": "GET /api/v1/documents",
+            "get_document": "GET /api/v1/documents/{document_id}",
+            "delete_document": "DELETE /api/v1/documents/{document_id}",
+            "ask_question": "POST /api/v1/ask",
+            "get_history": "GET /api/v1/history (?session_id=...&user_id=...)",
+            "clear_history": "DELETE /api/v1/history (?session_id=...&user_id=...)",
         },
     }

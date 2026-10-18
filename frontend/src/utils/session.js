@@ -10,9 +10,11 @@ const CHAT_HISTORY_PREFIX = "verdeshell_chat_history_";
 const SESSIONS_INDEX_KEY = "verdeshell_user_sessions_";
 
 function generateShortId(prefix = "id") {
-  const rand = Math.random().toString(36).substring(2, 8);
-  const time = Date.now().toString(36).slice(-4);
-  return `${prefix}_${rand}${time}`;
+  // Industry-standard 6-character hex suffix (16.7M combinations)
+  const hex = Math.floor(Math.random() * 0xffffff)
+    .toString(16)
+    .padStart(6, "0");
+  return `${prefix}_${hex}`;
 }
 
 export function getOrCreateSessionId() {
@@ -21,14 +23,14 @@ export function getOrCreateSessionId() {
     sessionId = generateShortId("sess");
     sessionStorage.setItem(SESSION_KEY, sessionId);
   }
-  recordSessionForUser(getOrCreateUserId(), sessionId);
   return sessionId;
 }
 
 export function getOrCreateUserId() {
   let userId = localStorage.getItem(USER_KEY);
-  if (!userId) {
-    userId = generateShortId("user");
+  // Auto-migrate legacy verbose IDs (e.g. "user_5liuvhkruc") to clean "usr_xxxxxx"
+  if (!userId || userId.startsWith("user_")) {
+    userId = generateShortId("usr");
     localStorage.setItem(USER_KEY, userId);
   }
   return userId;
@@ -47,7 +49,6 @@ export function setUserDisplayName(name) {
 export function setSessionId(newSessionId) {
   if (newSessionId && newSessionId.trim()) {
     sessionStorage.setItem(SESSION_KEY, newSessionId.trim());
-    recordSessionForUser(getOrCreateUserId(), newSessionId.trim());
   }
 }
 
@@ -60,7 +61,6 @@ export function setUserId(newUserId) {
 export function createNewSession() {
   const newId = generateShortId("sess");
   sessionStorage.setItem(SESSION_KEY, newId);
-  recordSessionForUser(getOrCreateUserId(), newId);
   return newId;
 }
 

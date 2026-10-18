@@ -194,7 +194,7 @@ class QuestionHistoryRepository(BaseRepository[QuestionHistory]):
     async def create(self, entity: QuestionHistory) -> QuestionHistory:
         """Persist a new Q&A audit record."""
         self.session.add(entity)
-        await self.session.flush()
+        await self.session.commit()
         return entity
 
     async def list_recent(
@@ -218,6 +218,36 @@ class QuestionHistoryRepository(BaseRepository[QuestionHistory]):
         record = await self.get_by_id(entity_id)
         if record:
             await self.session.delete(record)
-            await self.session.flush()
+            await self.session.commit()
             return True
         return False
+
+    async def count_records(
+        self,
+        session_id: str | None = None,
+        user_id: str | None = None,
+    ) -> int:
+        """Count Q&A history interactions matching tenant filters."""
+        stmt = select(func.count(QuestionHistory.id))
+        if session_id:
+            stmt = stmt.where(QuestionHistory.session_id == session_id)
+        if user_id:
+            stmt = stmt.where(QuestionHistory.user_id == user_id)
+        result = await self.session.execute(stmt)
+        return result.scalar_one() or 0
+
+    async def clear_history(
+        self,
+        session_id: str | None = None,
+        user_id: str | None = None,
+    ) -> int:
+        """Purge Q&A history for a given tenant session or user."""
+        stmt = delete(QuestionHistory)
+        if session_id:
+            stmt = stmt.where(QuestionHistory.session_id == session_id)
+        if user_id:
+            stmt = stmt.where(QuestionHistory.user_id == user_id)
+        result = await self.session.execute(stmt)
+        await self.session.commit()
+        return result.rowcount or 0
+

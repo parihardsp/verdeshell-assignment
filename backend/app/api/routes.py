@@ -20,19 +20,18 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.dependencies import (
-    get_chunker,
     get_document_service,
     get_embedding_provider,
     get_llm_provider,
+    get_query_repo,
     get_rag_service,
-    get_storage_service,
     get_vector_store,
 )
 from app.core.config import Settings, get_settings
 from app.core.rate_limiter import get_client_ip, rate_limit_ask
-from app.db.database import AsyncSessionLocal, get_db, get_session_factory
+from app.db.database import get_db, get_session_factory
 from app.db.models import Chunk, Document
-from app.db.repositories import ChunkRepository, DocumentRepository
+from app.db.repositories import ChunkRepository, DocumentRepository, QuestionHistoryRepository
 from app.ingestion.validator import FileValidationService
 from app.providers.embeddings import BaseEmbeddingProvider
 from app.providers.llm import BaseLLMProvider
@@ -47,7 +46,7 @@ from app.schemas.document import (
     JobStatusResponse,
     MultiFileUploadResponse,
 )
-from app.schemas.rag import AskRequest, AskResponse
+from app.schemas.rag import AskRequest, AskResponse, QuestionHistoryItem, QuestionHistoryResponse
 from app.services.chat_service import RAGService
 from app.services.document_service import DocumentService
 from app.services.job_manager import global_job_manager
@@ -261,7 +260,7 @@ async def stream_job_events(job_id: str):
                     yield f"data: {json.dumps(payload)}\n\n"
                     if payload.get("status") in ("completed", "failed", "completed_with_errors"):
                         break
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     yield ": ping\n\n"
         finally:
             await global_job_manager.unsubscribe(job_id, queue)
@@ -398,3 +397,95 @@ async def ask_question(
         user_id=effective_user,
         client_ip=client_ip,
     )
+
+
+@api_router.get(
+    "/history",
+    response_model=QuestionHistoryResponse,
+    tags=["Q&A"],
+    summary="Get Q&A history scoped to user and session",
+)
+async def get_question_history(
+    request: Request,
+    query_repo: Annotated[QuestionHistoryRepository, Depends(get_query_repo)],
+    session_id: str | None = Query(default=None, description="Filter history by session identifier"),
+    user_id: str | None = Query(default=None, description="Filter history by user identifier"),
+    limit: int = Query(default=50, ge=1, le=100, description="Page limit for historical interactions"),
+) -> QuestionHistoryResponse:
+    effective_user = (
+        user_id
+        or request.headers.get("x-user-id")
+        or request.headers.get("user-id")
+        or getattr(request.state, "user_id", None)
+    )
+    effective_session = (
+        session_id
+        or request.headers.get("x-session-id")
+        or request.headers.get("session-id")
+        or getattr(request.state, "session_id", None)
+    )
+
+    sess_filter = effective_session if effective_session and effective_session != "default" else None
+    user_filter = effective_user if effective_user and effective_user != "default_user" else None
+
+    records = await query_repo.list_recent(limit=limit, session_id=sess_filter, user_id=user_filter)
+    total = await query_repo.count_records(session_id=sess_filter, user_id=user_filter)
+
+    items = [
+        QuestionHistoryItem(
+            id=r.id,
+            question=r.question,
+            answer=r.answer,
+            sources=r.sources or [],
+            session_id=r.session_id,
+            user_id=r.user_id,
+            latency_ms=r.latency_ms,
+            client_ip=r.client_ip,
+            created_at=r.created_at,
+        )
+        for r in records
+    ]
+    return QuestionHistoryResponse(
+        items=items,
+        total=total,
+        session_id=sess_filter,
+        user_id=user_filter,
+    )
+
+
+@api_router.delete(
+    "/history",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["Q&A"],
+    summary="Clear Q&A history for active session and user",
+)
+async def clear_question_history(
+    request: Request,
+    query_repo: Annotated[QuestionHistoryRepository, Depends(get_query_repo)],
+    session_id: str | None = Query(default=None, description="Session identifier filter to clear"),
+    user_id: str | None = Query(default=None, description="User identifier filter to clear"),
+) -> None:
+    effective_user = (
+        user_id
+        or request.headers.get("x-user-id")
+        or request.headers.get("user-id")
+        or getattr(request.state, "user_id", None)
+    )
+    effective_session = (
+        session_id
+        or request.headers.get("x-session-id")
+        or request.headers.get("session-id")
+        or getattr(request.state, "session_id", None)
+    )
+
+    sess_filter = effective_session if effective_session and effective_session != "default" else None
+    user_filter = effective_user if effective_user and effective_user != "default_user" else None
+
+    if not sess_filter and not user_filter:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Specify either session_id or user_id to clear history.",
+        )
+
+    await query_repo.clear_history(session_id=sess_filter, user_id=user_filter)
+

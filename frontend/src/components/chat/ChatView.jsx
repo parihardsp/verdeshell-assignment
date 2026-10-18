@@ -69,6 +69,7 @@ export default function ChatView({
                 onSend={onSendMessage}
                 isLoading={isLoading}
                 isRateLimited={rateLimitSeconds > 0}
+                docCount={docCount}
               />
             </div>
 
@@ -119,6 +120,7 @@ export default function ChatView({
                 key={idx}
                 message={msg}
                 isLatest={idx === messages.length - 1 && msg.role === "assistant"}
+                onSwitchToDocsTab={onSwitchToDocsTab}
               />
             ))}
 
@@ -141,6 +143,7 @@ export default function ChatView({
             onSend={onSendMessage}
             isLoading={isLoading}
             isRateLimited={rateLimitSeconds > 0}
+            docCount={docCount}
           />
         </div>
       )}

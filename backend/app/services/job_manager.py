@@ -7,12 +7,11 @@ Server-Sent Events (SSE), and progress snapshots.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
 import uuid
 from collections import defaultdict
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Any
 
 from app.core.logging import LogPhase
@@ -58,7 +57,7 @@ class IngestionJobManager:
     ) -> IngestionJob:
         """Create and register a new pending ingestion job."""
         self.cleanup_stale_jobs()
-        job_id = f"job_{uuid.uuid4().hex[:10]}"
+        job_id = f"job_{uuid.uuid4().hex[:6]}"
         job = IngestionJob(
             job_id=job_id,
             session_id=session_id,
