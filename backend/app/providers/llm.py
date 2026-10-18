@@ -3,7 +3,9 @@
 Includes BaseLLMProvider, LangChainLLMProvider, GroqLLMProvider, GeminiLLMProvider, and MockLLMProvider.
 """
 
+import asyncio
 import logging
+import random
 import re
 import sys
 from abc import ABC, abstractmethod
@@ -14,6 +16,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel
 
 from app.core.exceptions import UpstreamProviderError
+from app.core.logging import LogPhase, mask_sensitive_data
 
 logger = logging.getLogger(__name__)
 
@@ -108,10 +111,11 @@ class LangChainLLMProvider(BaseLLMProvider):
             raise ValueError(f"Unsupported LangChain LLM provider: {provider}")
 
         logger.info(
-            "Initialized LangChainLLMProvider (provider=%s, model=%s, max_tokens=%d) with LangSmith tracing.",
+            "LLM provider initialized | provider=%s model=%s max_tokens=%d tracing=langsmith",
             self.provider,
             model,
             self.max_tokens,
+            extra={"phase": LogPhase.PROVIDER},
         )
 
     async def generate_response(
@@ -157,7 +161,12 @@ class LangChainLLMProvider(BaseLLMProvider):
                 return "".join(text_parts).strip()
             return str(content).strip()
         except Exception as exc:
-            logger.error("LangChain LLM invocation failed: %s", exc)
+            logger.error(
+                "Provider invocation failed | provider=%s error=%s",
+                self.provider,
+                type(exc).__name__,
+                extra={"phase": LogPhase.PROVIDER},
+            )
             raise UpstreamProviderError(f"LangChain LLM provider failed: {exc!s}", status_code=502)
 
     async def generate_structured(
@@ -202,10 +211,11 @@ class LangChainLLMProvider(BaseLLMProvider):
                 return schema.model_validate(result)
         except Exception as exc:
             logger.warning(
-                "Native structured output with %s encountered an issue (%s: %s). Falling back to JSON parsing...",
+                "Provider structured output fallback to JSON | provider=%s schema=%s error=%s",
                 self.provider,
+                schema.__name__,
                 type(exc).__name__,
-                exc,
+                extra={"phase": LogPhase.PROVIDER},
             )
 
         # Fallback: prompt for JSON schema and parse
@@ -255,7 +265,7 @@ class GroqLLMProvider(BaseLLMProvider):
         temperature: float = 0.1,
         max_tokens: int = 10000,
     ) -> str:
-        """Execute async completion request against Groq endpoint."""
+        """Execute async completion request against Groq endpoint with retry backoff."""
         url = f"{self.base_url}/openai/v1/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -271,38 +281,74 @@ class GroqLLMProvider(BaseLLMProvider):
             "max_tokens": max_tokens,
         }
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                response = await client.post(url, headers=headers, json=payload)
-                if response.status_code == 429:
-                    raise UpstreamProviderError(
-                        message="Upstream Groq LLM rate limit exceeded. Please retry later.",
-                        status_code=503,
-                        headers={"Retry-After": "30"},
+        max_retries = 2
+        base_delay = 5.0
+
+        for attempt in range(max_retries + 1):
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                try:
+                    response = await client.post(url, headers=headers, json=payload)
+                    if response.status_code == 429:
+                        if attempt < max_retries:
+                            delay = base_delay * (2**attempt) + random.uniform(0.1, 0.4)
+                            logger.warning(
+                                "Provider rate limit encountered, backing off | provider=groq attempt=%d max_retries=%d backoff_s=%.1f",
+                                attempt + 1,
+                                max_retries,
+                                delay,
+                                extra={"phase": LogPhase.PROVIDER},
+                            )
+                            await asyncio.sleep(delay)
+                            continue
+                        raise UpstreamProviderError(
+                            message="Upstream Groq LLM rate limit exceeded. Please retry later.",
+                            status_code=429,
+                            headers={"Retry-After": "30"},
+                        )
+                    response.raise_for_status()
+                    data = response.json()
+                    choices = data.get("choices", [])
+                    if not choices:
+                        raise UpstreamProviderError("Groq returned empty response choices.")
+
+                    return choices[0].get("message", {}).get("content", "").strip()
+
+                except httpx.TimeoutException as exc:
+                    if attempt < max_retries:
+                        delay = base_delay * (2**attempt) + random.uniform(0.1, 0.4)
+                        logger.warning(
+                            "Provider request timed out, retrying | provider=groq attempt=%d max_retries=%d backoff_s=%.1f",
+                            attempt + 1,
+                            max_retries,
+                            delay,
+                            extra={"phase": LogPhase.PROVIDER},
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    logger.error(
+                        "Provider request timed out | provider=groq error=%s",
+                        type(exc).__name__,
+                        extra={"phase": LogPhase.PROVIDER},
                     )
-                response.raise_for_status()
-                data = response.json()
-                choices = data.get("choices", [])
-                if not choices:
-                    raise UpstreamProviderError("Groq returned empty response choices.")
+                    raise UpstreamProviderError(
+                        "Upstream Groq request timed out.", status_code=504
+                    )
+                except httpx.HTTPStatusError as exc:
+                    logger.error(
+                        "Provider HTTP request failed | provider=groq status=%d",
+                        exc.response.status_code,
+                        extra={"phase": LogPhase.PROVIDER},
+                    )
+                    raise UpstreamProviderError(
+                        f"Groq API returned status {exc.response.status_code}.",
+                        status_code=502,
+                    )
+                except (UpstreamProviderError, Exception):
+                    raise
 
-                return choices[0].get("message", {}).get("content", "").strip()
-
-            except httpx.TimeoutException as exc:
-                logger.error("Groq LLM request timed out: %s", exc)
-                raise UpstreamProviderError("Upstream Groq request timed out.", status_code=504)
-            except httpx.HTTPStatusError as exc:
-                logger.error(
-                    "Groq LLM HTTP error %s: %s",
-                    exc.response.status_code,
-                    exc.response.text,
-                )
-                raise UpstreamProviderError(
-                    f"Groq API returned status {exc.response.status_code}.",
-                    status_code=502,
-                )
-            except (UpstreamProviderError, Exception):
-                raise
+        raise UpstreamProviderError(
+            "Upstream Groq LLM rate limit exceeded after retries.", status_code=429
+        )
 
 
 class GeminiLLMProvider(BaseLLMProvider):
@@ -327,8 +373,12 @@ class GeminiLLMProvider(BaseLLMProvider):
         temperature: float = 0.1,
         max_tokens: int = 10000,
     ) -> str:
-        """Execute async completion request against Google Gemini."""
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.api_key}"
+        """Execute async completion request against Google Gemini with header auth and retry backoff."""
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+        headers = {
+            "x-goog-api-key": self.api_key,
+            "Content-Type": "application/json",
+        }
 
         payload = {
             "system_instruction": {"parts": [{"text": system_prompt}]},
@@ -344,43 +394,79 @@ class GeminiLLMProvider(BaseLLMProvider):
             },
         }
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                response = await client.post(url, json=payload)
-                if response.status_code == 429:
-                    raise UpstreamProviderError(
-                        message="Upstream Gemini LLM rate limit exceeded. Please retry later.",
-                        status_code=503,
-                        headers={"Retry-After": "30"},
+        max_retries = 2
+        base_delay = 5.0
+
+        for attempt in range(max_retries + 1):
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                try:
+                    response = await client.post(url, headers=headers, json=payload)
+                    if response.status_code == 429:
+                        if attempt < max_retries:
+                            delay = base_delay * (2**attempt) + random.uniform(0.1, 0.4)
+                            logger.warning(
+                                "Provider rate limit encountered, backing off | provider=gemini attempt=%d max_retries=%d backoff_s=%.1f",
+                                attempt + 1,
+                                max_retries,
+                                delay,
+                                extra={"phase": LogPhase.PROVIDER},
+                            )
+                            await asyncio.sleep(delay)
+                            continue
+                        raise UpstreamProviderError(
+                            message="Upstream Gemini LLM rate limit exceeded. Please retry later.",
+                            status_code=429,
+                            headers={"Retry-After": "30"},
+                        )
+                    response.raise_for_status()
+                    data = response.json()
+
+                    candidates = data.get("candidates", [])
+                    if not candidates:
+                        raise UpstreamProviderError("Gemini generated no response candidates.")
+
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    if not parts:
+                        return "The knowledge assistant could not formulate an answer."
+
+                    return parts[0].get("text", "").strip()
+
+                except httpx.TimeoutException as exc:
+                    if attempt < max_retries:
+                        delay = base_delay * (2**attempt) + random.uniform(0.1, 0.4)
+                        logger.warning(
+                            "Provider request timed out, retrying | provider=gemini attempt=%d max_retries=%d backoff_s=%.1f",
+                            attempt + 1,
+                            max_retries,
+                            delay,
+                            extra={"phase": LogPhase.PROVIDER},
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    logger.error(
+                        "Provider request timed out | provider=gemini error=%s",
+                        type(exc).__name__,
+                        extra={"phase": LogPhase.PROVIDER},
                     )
-                response.raise_for_status()
-                data = response.json()
+                    raise UpstreamProviderError(
+                        "Upstream Gemini request timed out.", status_code=504
+                    )
+                except httpx.HTTPStatusError as exc:
+                    logger.error(
+                        "Provider HTTP request failed | provider=gemini status=%d",
+                        exc.response.status_code,
+                        extra={"phase": LogPhase.PROVIDER},
+                    )
+                    raise UpstreamProviderError(
+                        f"Gemini LLM API returned status {exc.response.status_code}.",
+                        status_code=502,
+                    )
+                except (UpstreamProviderError, Exception):
+                    raise
 
-                candidates = data.get("candidates", [])
-                if not candidates:
-                    raise UpstreamProviderError("Gemini generated no response candidates.")
-
-                parts = candidates[0].get("content", {}).get("parts", [])
-                if not parts:
-                    return "The knowledge assistant could not formulate an answer."
-
-                return parts[0].get("text", "").strip()
-
-            except httpx.TimeoutException as exc:
-                logger.error("Gemini LLM request timed out: %s", exc)
-                raise UpstreamProviderError("Upstream Gemini request timed out.", status_code=504)
-            except httpx.HTTPStatusError as exc:
-                logger.error(
-                    "Gemini LLM HTTP error %s: %s",
-                    exc.response.status_code,
-                    exc.response.text,
-                )
-                raise UpstreamProviderError(
-                    f"Gemini LLM API returned status {exc.response.status_code}.",
-                    status_code=502,
-                )
-            except (UpstreamProviderError, Exception):
-                raise
+        raise UpstreamProviderError(
+            "Upstream Gemini LLM rate limit exceeded after retries.", status_code=429
+        )
 
 
 class MockLLMProvider(BaseLLMProvider):

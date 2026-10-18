@@ -13,6 +13,7 @@ from pathlib import Path
 import chromadb
 
 from app.core.config import get_settings
+from app.core.logging import LogPhase
 
 logger = logging.getLogger(__name__)
 _settings = get_settings()
@@ -93,10 +94,11 @@ class ChromaVectorStore(BaseVectorStore):
             metadata={"hnsw:space": "cosine"},
         )
         logger.info(
-            "Initialized ChromaVectorStore at '%s' with collection '%s' (%d items).",
-            self.persist_path,
+            "Vector store initialized | provider=ChromaDB collection=%s items=%d path=%s",
             self.collection_name,
             self._collection.count(),
+            self.persist_path,
+            extra={"phase": LogPhase.VECTOR_STORE},
         )
 
     def count(self) -> int:
@@ -112,7 +114,12 @@ class ChromaVectorStore(BaseVectorStore):
                 metadata={"hnsw:space": "cosine"},
             )
         except Exception as exc:
-            logger.warning("Error clearing Chroma collection: %s", exc)
+            logger.warning(
+                "Vector store clear failed | collection=%s error=%s",
+                self.collection_name,
+                type(exc).__name__,
+                extra={"phase": LogPhase.VECTOR_STORE},
+            )
 
     def _sync_add_chunks(self, chunks: list[IndexedChunk]) -> None:
         if not chunks:
@@ -144,9 +151,10 @@ class ChromaVectorStore(BaseVectorStore):
         except Exception as exc:
             if "dimension" in str(exc).lower() or "does not match" in str(exc).lower():
                 logger.warning(
-                    "ChromaDB dimension mismatch (%s). Re-creating collection '%s' with new vector dimension.",
-                    exc,
+                    "Vector dimension mismatch detected, re-creating collection | collection=%s error=%s",
                     self.collection_name,
+                    type(exc).__name__,
+                    extra={"phase": LogPhase.VECTOR_STORE},
                 )
                 self._client.delete_collection(self.collection_name)
                 self._collection = self._client.get_or_create_collection(
@@ -200,8 +208,10 @@ class ChromaVectorStore(BaseVectorStore):
         except Exception as exc:
             if "dimension" in str(exc).lower() or "does not match" in str(exc).lower():
                 logger.warning(
-                    "Query vector dimension mismatch with collection (%s). Returning empty.",
-                    exc,
+                    "Query vector dimension mismatch, returning empty | collection=%s error=%s",
+                    self.collection_name,
+                    type(exc).__name__,
+                    extra={"phase": LogPhase.VECTOR_STORE},
                 )
                 return []
             raise

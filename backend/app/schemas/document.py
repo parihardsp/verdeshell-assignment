@@ -66,6 +66,7 @@ class DocumentResponse(BaseModel):
     user_id: str | None = Field(default="default_user", description="Associated user ID")
     file_name: str | None = Field(default=None, description="Original filename if uploaded")
     total_pages: int | None = Field(default=None, description="Total pages if PDF")
+    content: str | None = Field(default=None, description="Extracted textual content of the document")
     created_at: datetime | None = Field(default=None, description="Creation timestamp")
 
 
@@ -102,6 +103,7 @@ class UploadedFileSummary(BaseModel):
     chunk_count: int
     total_pages: int
     saved_path: str
+    error_message: str | None = None
 
 
 class MultiFileUploadResponse(BaseModel):
@@ -113,6 +115,43 @@ class MultiFileUploadResponse(BaseModel):
     )
     upload_date: str = Field(..., description="UTC date string (YYYY-MM-DD)")
     total_files: int = Field(..., description="Number of files processed")
+    indexed_count: int = Field(default=0, description="Number of successfully indexed documents")
+    failed_count: int = Field(default=0, description="Number of failed/skipped documents")
     documents: list[UploadedFileSummary] = Field(
         default_factory=list, description="Details of indexed documents"
     )
+
+
+class AsyncIngestionJobResponse(BaseModel):
+    """Schema returned on HTTP 202 Accepted for asynchronous document ingestion."""
+
+    job_id: str = Field(..., description="Unique asynchronous job identifier")
+    session_id: str = Field(..., description="Target session identifier")
+    user_id: str = Field(..., description="Target user identifier")
+    status: Literal["queued", "processing", "completed", "failed", "completed_with_errors"] = Field(
+        ..., description="Current job status"
+    )
+    total_files: int = Field(..., description="Total files queued in this job")
+    message: str = Field(..., description="Human-readable job status message")
+    poll_url: str = Field(..., description="URL to poll job status JSON snapshot")
+    stream_url: str = Field(..., description="URL to stream real-time SSE progress events")
+
+
+class JobStatusResponse(BaseModel):
+    """Schema returned by GET /documents/jobs/{job_id}."""
+
+    job_id: str
+    session_id: str
+    user_id: str
+    status: str
+    stage: str
+    percent: int
+    message: str
+    current_file: str | None = None
+    processed_files: int
+    total_files: int
+    results: list[UploadedFileSummary] = Field(default_factory=list)
+    errors: list[dict] = Field(default_factory=list)
+    created_at: float
+    updated_at: float
+
