@@ -74,9 +74,13 @@ frontend/build/
 *.sqlite3
 *.db-journal
 *.sqlite-journal
+*.db-wal
+*.db-shm
 data/*.db
 data/*.sqlite
 data/*.sqlite3
+data/*.db-wal
+data/*.db-shm
 data/uploads/
 data/chroma_db/
 chroma_db/
@@ -102,3 +106,4 @@ logs/
 *.seed
 tmp/
 scratch/
+*.ruff_cache
